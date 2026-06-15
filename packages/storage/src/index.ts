@@ -16,6 +16,7 @@ export type {
   TaskClaimRow,
   TaskRow,
   TaskEventRow,
+  ActiveWriteScopeConflict,
   CreateTaskInput,
   ClaimTaskInput,
   UpdateTaskInput,

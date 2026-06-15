@@ -118,6 +118,14 @@ export interface TaskEventRow {
   ts: number;
 }
 
+export interface ActiveWriteScopeConflict {
+  task_id: string;
+  title: string;
+  agent_id: string | null;
+  owner_agent_id: string | null;
+  scope: unknown;
+}
+
 export interface CreateTaskInput {
   id?: string;
   project_id: string;

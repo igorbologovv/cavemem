@@ -313,6 +313,291 @@ describe('Storage', () => {
     ]);
   });
 
+  it('blocks an active overlapping write scope claim', () => {
+    storage.createTask({
+      id: 'active',
+      project_id: 'project-a',
+      title: 'Active write',
+      description: 'Owns main',
+      access: 'write',
+      scope: ['src/main.rs'],
+    });
+    storage.createTask({
+      id: 'same-file',
+      project_id: 'project-a',
+      title: 'Same file',
+      description: 'Also wants main',
+      access: 'write',
+      scope: ['src/main.rs'],
+    });
+    storage.createTask({
+      id: 'glob',
+      project_id: 'project-a',
+      title: 'Glob',
+      description: 'Broad source write',
+      access: 'write',
+      scope: ['src/**'],
+    });
+
+    expect(
+      storage.claimTaskById({ task_id: 'active', project_id: 'project-a', agent_id: 'agent-a' }),
+    )?.toMatchObject({ id: 'active', status: 'in_progress' });
+    expect(
+      storage.claimTaskById({
+        task_id: 'same-file',
+        project_id: 'project-a',
+        agent_id: 'agent-b',
+      }),
+    ).toBeNull();
+    expect(
+      storage.claimTaskById({ task_id: 'glob', project_id: 'project-a', agent_id: 'agent-b' }),
+    ).toBeNull();
+    expect(
+      storage.findActiveWriteScopeConflicts({
+        project_id: 'project-a',
+        scope: ['**'],
+        exclude_task_id: 'glob',
+      }),
+    ).toMatchObject([{ task_id: 'active', agent_id: 'agent-a' }]);
+  });
+
+  it('does not block identical write scopes across different projects', () => {
+    storage.createTask({
+      id: 'project-a-main',
+      project_id: 'project-a',
+      title: 'Project A main',
+      description: 'Owns main in project A',
+      access: 'write',
+      scope: ['src/main.rs'],
+    });
+    storage.createTask({
+      id: 'project-b-main',
+      project_id: 'project-b',
+      title: 'Project B main',
+      description: 'Owns main in project B',
+      access: 'write',
+      scope: ['src/main.rs'],
+    });
+
+    expect(
+      storage.claimTaskById({
+        task_id: 'project-a-main',
+        project_id: 'project-a',
+        agent_id: 'agent-a',
+      }),
+    ).toMatchObject({ id: 'project-a-main', status: 'in_progress' });
+    expect(
+      storage.claimTaskById({
+        task_id: 'project-b-main',
+        project_id: 'project-b',
+        agent_id: 'agent-b',
+      }),
+    ).toMatchObject({ id: 'project-b-main', status: 'in_progress' });
+  });
+
+  it('blocks narrower write work when an active broad scope is claimed', () => {
+    storage.createTask({
+      id: 'broad-dot',
+      project_id: 'project-a',
+      title: 'Broad dot',
+      description: 'Owns the project',
+      access: 'write',
+      scope: ['.'],
+    });
+    storage.createTask({
+      id: 'narrow-after-dot',
+      project_id: 'project-a',
+      title: 'Narrow after dot',
+      description: 'Wants main',
+      access: 'write',
+      scope: ['src/main.rs'],
+    });
+    storage.createTask({
+      id: 'broad-star',
+      project_id: 'project-b',
+      title: 'Broad star',
+      description: 'Owns the project',
+      access: 'write',
+      scope: ['**'],
+    });
+    storage.createTask({
+      id: 'narrow-after-star',
+      project_id: 'project-b',
+      title: 'Narrow after star',
+      description: 'Wants main',
+      access: 'write',
+      scope: ['src/main.rs'],
+    });
+
+    expect(
+      storage.claimTaskById({
+        task_id: 'broad-dot',
+        project_id: 'project-a',
+        agent_id: 'agent-a',
+      }),
+    ).not.toBeNull();
+    expect(
+      storage.claimTaskById({
+        task_id: 'narrow-after-dot',
+        project_id: 'project-a',
+        agent_id: 'agent-b',
+      }),
+    ).toBeNull();
+    expect(
+      storage.claimTaskById({
+        task_id: 'broad-star',
+        project_id: 'project-b',
+        agent_id: 'agent-a',
+      }),
+    ).not.toBeNull();
+    expect(
+      storage.claimTaskById({
+        task_id: 'narrow-after-star',
+        project_id: 'project-b',
+        agent_id: 'agent-b',
+      }),
+    ).toBeNull();
+  });
+
+  it('blocks parent and child write scope overlaps in either direction', () => {
+    storage.createTask({
+      id: 'parent',
+      project_id: 'project-a',
+      title: 'Parent',
+      description: 'Owns app',
+      access: 'write',
+      scope: ['apps/mcp-server/**'],
+    });
+    storage.createTask({
+      id: 'child',
+      project_id: 'project-a',
+      title: 'Child',
+      description: 'Server file',
+      access: 'write',
+      scope: ['apps/mcp-server/src/server.ts'],
+    });
+    expect(
+      storage.claimTaskById({ task_id: 'parent', project_id: 'project-a', agent_id: 'agent-a' }),
+    ).not.toBeNull();
+    expect(
+      storage.claimTaskById({ task_id: 'child', project_id: 'project-a', agent_id: 'agent-b' }),
+    ).toBeNull();
+
+    storage.releaseTask({ id: 'parent', project_id: 'project-a', agent_id: 'agent-a' });
+    expect(
+      storage.claimTaskById({ task_id: 'child', project_id: 'project-a', agent_id: 'agent-b' }),
+    ).not.toBeNull();
+    expect(
+      storage.claimTaskById({ task_id: 'parent', project_id: 'project-a', agent_id: 'agent-c' }),
+    ).toBeNull();
+  });
+
+  it('allows non-overlapping write scopes and overlapping read-only review claims', () => {
+    storage.createTask({
+      id: 'active',
+      project_id: 'project-a',
+      title: 'Active',
+      description: 'MCP work',
+      access: 'write',
+      scope: ['apps/mcp-server/**'],
+    });
+    storage.createTask({
+      id: 'storage',
+      project_id: 'project-a',
+      title: 'Storage',
+      description: 'Storage work',
+      access: 'write',
+      scope: ['packages/storage/**'],
+    });
+    storage.createTask({
+      id: 'review',
+      project_id: 'project-a',
+      title: 'Review',
+      description: 'Read-only review',
+      kind: 'review',
+      access: 'read_only',
+      mode: 'parallel_review',
+      scope: ['apps/mcp-server/src/server.ts'],
+      max_claims: 3,
+      required_results: 3,
+    });
+
+    expect(
+      storage.claimTaskById({ task_id: 'active', project_id: 'project-a', agent_id: 'agent-a' }),
+    ).not.toBeNull();
+    expect(
+      storage.claimTaskById({ task_id: 'storage', project_id: 'project-a', agent_id: 'agent-b' }),
+    ).toMatchObject({ id: 'storage', status: 'in_progress' });
+    expect(
+      storage.claimTaskById({ task_id: 'review', project_id: 'project-a', agent_id: 'agent-c' }),
+    ).toMatchObject({ id: 'review', status: 'in_progress' });
+  });
+
+  it('does not block on completed or released write tasks', () => {
+    storage.createTask({
+      id: 'done',
+      project_id: 'project-a',
+      title: 'Done',
+      description: 'Old write',
+      access: 'write',
+      scope: ['src/main.rs'],
+    });
+    storage.createTask({
+      id: 'next',
+      project_id: 'project-a',
+      title: 'Next',
+      description: 'New write',
+      access: 'write',
+      scope: ['src/**'],
+    });
+    storage.claimTaskById({ task_id: 'done', project_id: 'project-a', agent_id: 'agent-a' });
+    storage.completeTask({ id: 'done', project_id: 'project-a', agent_id: 'agent-a' });
+
+    expect(
+      storage.claimTaskById({ task_id: 'next', project_id: 'project-a', agent_id: 'agent-b' }),
+    ).toMatchObject({ id: 'next' });
+    storage.releaseTask({ id: 'next', project_id: 'project-a', agent_id: 'agent-b' });
+    expect(
+      storage.claimTaskById({ task_id: 'next', project_id: 'project-a', agent_id: 'agent-c' }),
+    ).toMatchObject({ id: 'next' });
+  });
+
+  it('claimNext skips write tasks with locked scopes', () => {
+    storage.createTask({
+      id: 'active',
+      project_id: 'project-a',
+      title: 'Active',
+      description: 'Owns main',
+      access: 'write',
+      priority: 10,
+      scope: ['src/main.rs'],
+    });
+    storage.createTask({
+      id: 'blocked',
+      project_id: 'project-a',
+      title: 'Blocked',
+      description: 'Overlaps main',
+      access: 'write',
+      priority: 9,
+      scope: ['.'],
+    });
+    storage.createTask({
+      id: 'safe',
+      project_id: 'project-a',
+      title: 'Safe',
+      description: 'Separate package',
+      access: 'write',
+      priority: 1,
+      scope: ['packages/storage/**'],
+    });
+    storage.claimTaskById({ task_id: 'active', project_id: 'project-a', agent_id: 'agent-a' });
+
+    expect(storage.claimNextTask({ project_id: 'project-a', agent_id: 'agent-b' })).toMatchObject({
+      id: 'safe',
+    });
+    expect(storage.getTask('blocked')).toMatchObject({ status: 'todo' });
+  });
+
   it('rejects completion without an active claim and leaves the task unchanged', () => {
     storage.createTask({
       id: 'task-a',

@@ -158,6 +158,39 @@ describe('MCP server', () => {
     expect(payload.claim.task.status).toBe('in_progress');
   });
 
+  it('ask does not claim a second active write task over an owned file scope', async () => {
+    if (!store) throw new Error('local store is not initialized');
+    vi.stubEnv('CAVEMEM_AGENT_ID', 'agent-b');
+    vi.stubEnv('CAVEMEM_PROJECT_ID', 'project-a');
+
+    store.storage.createTask({
+      id: 'active',
+      project_id: 'project-a',
+      title: 'Active main',
+      description: 'Owns src/main.rs',
+      access: 'write',
+      scope: ['src/main.rs'],
+    });
+    store.storage.claimTaskById({
+      task_id: 'active',
+      project_id: 'project-a',
+      agent_id: 'agent-a',
+    });
+
+    const result = await client.callTool({
+      name: 'ask',
+      arguments: { request: 'Fix main.rs' },
+    });
+
+    expect(result.isError).toBe(true);
+    expect(toolText(result)).toContain('active write task active claimed by agent-a');
+    expect(
+      store.storage
+        .listTasks('project-a')
+        .filter((task) => task.access === 'write' && task.status === 'in_progress'),
+    ).toHaveLength(1);
+  });
+
   it('ask honors explicit read-only review constraints', async () => {
     vi.stubEnv('CAVEMEM_AGENT_ID', 'agent-a');
     vi.stubEnv('CAVEMEM_PROJECT_ID', 'project-a');
@@ -611,6 +644,38 @@ describe('MCP endpoint mode', () => {
         },
       ],
     ]);
+  });
+
+  it('ask surfaces endpoint write scope claim conflicts', async () => {
+    vi.stubEnv('CAVEMEM_AGENT_ID', 'agent-b');
+    vi.stubEnv('CAVEMEM_PROJECT_ID', 'project-a');
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ id: 'task-b', status: 'todo' }), { status: 201 }),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            error: 'active write task task-a claimed by agent-a already owns overlapping scope',
+            conflict: { task_id: 'task-a', agent_id: 'agent-a' },
+          }),
+          { status: 409 },
+        ),
+      );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await client.callTool({
+      name: 'ask',
+      arguments: { request: 'Fix main.rs' },
+    });
+
+    expect(result.isError).toBe(true);
+    expect(toolText(result)).toContain('active write task task-a claimed by agent-a');
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      'https://coordinator.test/api/tasks/task-b/claim',
+      expect.objectContaining({ method: 'POST' }),
+    );
   });
 
   it('forwards claim_task id to the exact-task claim endpoint', async () => {

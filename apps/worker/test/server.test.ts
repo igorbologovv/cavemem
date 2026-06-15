@@ -130,6 +130,46 @@ describe('worker HTTP', () => {
     expect(store.storage.getTask('high')?.status).toBe('todo');
   });
 
+  it('rejects exact write claims when another active write task owns the scope', async () => {
+    store.storage.createTask({
+      id: 'active',
+      project_id: 'project-a',
+      title: 'Active write',
+      description: 'Owns main',
+      access: 'write',
+      scope: ['src/main.rs'],
+    });
+    store.storage.createTask({
+      id: 'blocked',
+      project_id: 'project-a',
+      title: 'Blocked write',
+      description: 'Overlaps main',
+      access: 'write',
+      scope: ['src/**'],
+    });
+    store.storage.claimTaskById({
+      task_id: 'active',
+      project_id: 'project-a',
+      agent_id: 'agent-a',
+    });
+
+    const res = await app.request('/api/tasks/blocked/claim', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-cavemem-agent-id': 'agent-b',
+        'x-cavemem-project-id': 'project-a',
+      },
+      body: '{}',
+    });
+
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({
+      error: expect.stringContaining('active write task active claimed by agent-a'),
+      conflict: { task_id: 'active', agent_id: 'agent-a' },
+    });
+  });
+
   it('rejects cross-agent and cross-project task mutations', async () => {
     store.storage.createTask({
       id: 'task-a',

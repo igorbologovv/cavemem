@@ -5,6 +5,7 @@ import Database from 'better-sqlite3';
 import { SCHEMA_SQL } from './schema.js';
 import type {
   AgentRow,
+  ActiveWriteScopeConflict,
   ClaimTaskInput,
   CreateTaskInput,
   NewObservation,
@@ -20,6 +21,79 @@ import type {
   TaskStatus,
   UpdateTaskInput,
 } from './types.js';
+
+type ScopeSpec =
+  | { kind: 'all'; raw: string }
+  | { kind: 'path'; raw: string; path: string }
+  | { kind: 'prefix'; raw: string; prefix: string };
+
+function parseScopeList(scope: unknown): ScopeSpec[] {
+  let values: unknown = scope;
+  if (typeof scope === 'string') {
+    try {
+      values = JSON.parse(scope);
+    } catch {
+      values = [scope];
+    }
+  }
+
+  if (!Array.isArray(values) || values.length === 0) return [{ kind: 'all', raw: '**' }];
+
+  return values.flatMap((value): ScopeSpec[] => {
+    if (typeof value !== 'string') return [{ kind: 'all', raw: String(value) }];
+    const raw = value.trim();
+    if (!raw || raw === '.' || raw === '**') return [{ kind: 'all', raw }];
+
+    const normalized = raw
+      .replaceAll('\\', '/')
+      .replace(/\/+/g, '/')
+      .replace(/^\.\//, '')
+      .replace(/\/$/, '');
+
+    if (!normalized || normalized === '.' || normalized === '**') return [{ kind: 'all', raw }];
+    if (normalized.endsWith('/**')) {
+      const prefix = normalized.slice(0, -3).replace(/\/$/, '');
+      return prefix ? [{ kind: 'prefix', raw, prefix }] : [{ kind: 'all', raw }];
+    }
+
+    if (/[*?[\]{}]/.test(normalized)) return [{ kind: 'all', raw }];
+    return [{ kind: 'path', raw, path: normalized }];
+  });
+}
+
+function isSameOrChild(path: string, parent: string): boolean {
+  return path === parent || path.startsWith(`${parent}/`);
+}
+
+function basename(path: string): string {
+  return path.split('/').at(-1) ?? path;
+}
+
+function pathsOverlap(left: string, right: string): boolean {
+  if (left === right) return true;
+  if (!left.includes('/') && basename(right) === left) return true;
+  if (!right.includes('/') && basename(left) === right) return true;
+  return false;
+}
+
+function scopeSpecsOverlap(left: ScopeSpec, right: ScopeSpec): boolean {
+  if (left.kind === 'all' || right.kind === 'all') return true;
+  if (left.kind === 'path' && right.kind === 'path') return pathsOverlap(left.path, right.path);
+  if (left.kind === 'prefix' && right.kind === 'path') return isSameOrChild(right.path, left.prefix);
+  if (left.kind === 'path' && right.kind === 'prefix') return isSameOrChild(left.path, right.prefix);
+  if (left.kind === 'prefix' && right.kind === 'prefix') {
+    return isSameOrChild(left.prefix, right.prefix) || isSameOrChild(right.prefix, left.prefix);
+  }
+  return true;
+}
+
+function scopesOverlap(left: unknown, right: unknown): boolean {
+  const leftSpecs = parseScopeList(left);
+  const rightSpecs = parseScopeList(right);
+  return leftSpecs.some((leftSpec) =>
+    rightSpecs.some((rightSpec) => scopeSpecsOverlap(leftSpec, rightSpec)),
+  );
+}
 
 export interface StorageOptions {
   readonly?: boolean;
@@ -373,6 +447,50 @@ export class Storage {
       .all(projectId, limit) as TaskRow[];
   }
 
+  findActiveWriteScopeConflicts(p: {
+    project_id: string;
+    scope: unknown;
+    exclude_task_id?: string;
+    now?: number;
+  }): ActiveWriteScopeConflict[] {
+    const now = p.now ?? Date.now();
+    const active = this.db
+      .prepare(
+        `SELECT
+           t.id AS task_id,
+           t.title AS title,
+           t.owner_agent_id AS owner_agent_id,
+           t.scope AS scope,
+           c.agent_id AS agent_id
+         FROM task_claims c
+         JOIN tasks t ON t.id = c.task_id
+         WHERE t.project_id = ?
+           AND t.access = 'write'
+           AND t.status = 'in_progress'
+           AND c.status = 'claimed'
+           AND (c.lease_until IS NULL OR c.lease_until >= ?)
+           AND (? IS NULL OR t.id != ?)
+         ORDER BY t.priority DESC, t.created_at ASC`,
+      )
+      .all(p.project_id, now, p.exclude_task_id ?? null, p.exclude_task_id ?? null) as Array<{
+      task_id: string;
+      title: string;
+      agent_id: string | null;
+      owner_agent_id: string | null;
+      scope: string | null;
+    }>;
+
+    return active
+      .filter((task) => scopesOverlap(task.scope, p.scope))
+      .map((task) => ({
+        task_id: task.task_id,
+        title: task.title,
+        agent_id: task.agent_id,
+        owner_agent_id: task.owner_agent_id,
+        scope: task.scope === null ? null : JSON.parse(task.scope),
+      }));
+  }
+
   claimNextTask(p: ClaimTaskInput): TaskRow | null {
     const now = Date.now();
     const leaseMs = p.lease_ms ?? 10 * 60 * 1000;
@@ -404,7 +522,7 @@ export class Storage {
         return active;
       }
 
-      const candidate = this.db
+      const candidates = this.db
         .prepare(
           `SELECT t.*
            FROM tasks t
@@ -436,10 +554,11 @@ export class Storage {
                  ) < t.max_claims
                )
              )
-           ORDER BY t.priority DESC, t.created_at ASC
-           LIMIT 1`,
+           ORDER BY t.priority DESC, t.created_at ASC`,
         )
-        .get(p.project_id, p.agent_id) as TaskRow | undefined;
+        .all(p.project_id, p.agent_id) as TaskRow[];
+
+      const candidate = candidates.find((task) => !this.hasActiveWriteScopeConflict(task, now));
 
       if (!candidate) {
         this.upsertAgent({
@@ -515,6 +634,8 @@ export class Storage {
           .get(task.id) as { n: number };
         if (claims.n >= task.max_claims) return null;
       }
+
+      if (this.hasActiveWriteScopeConflict(task, now)) return null;
 
       return this.claimSelectedTask(task, p.agent_id, leaseUntil, now);
     });
@@ -828,6 +949,18 @@ export class Storage {
            LIMIT 1`,
         )
         .get(taskId, projectId, agentId, now),
+    );
+  }
+
+  private hasActiveWriteScopeConflict(task: TaskRow, now: number): boolean {
+    if (task.access !== 'write') return false;
+    return (
+      this.findActiveWriteScopeConflicts({
+        project_id: task.project_id,
+        scope: task.scope,
+        exclude_task_id: task.id,
+        now,
+      }).length > 0
     );
   }
 

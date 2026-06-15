@@ -212,6 +212,13 @@ function inferTaskPlan(rawRequest: string): TaskPlan {
     if (/\bcli\b/.test(lower)) scope.add('apps/cli/**');
   }
 
+  for (const match of request.matchAll(
+    /(?:^|[\s`'"])(\.?[\w.-]+(?:\/[\w.@+-]+)*\.[A-Za-z0-9]+)(?=$|[\s`,;'")])/g,
+  )) {
+    const fileScope = match[1]?.replace(/^\.\//, '');
+    if (fileScope) scope.add(fileScope);
+  }
+
   if (scope.size === 0) {
     scope.add('packages/**');
     scope.add('apps/**');
@@ -238,6 +245,18 @@ function requireStore(store: MemoryStore | null): MemoryStore {
     throw new Error('MemoryStore is unavailable because CAVEMEM_ENDPOINT mode is active');
   }
   return store;
+}
+
+function writeScopeConflictMessage(conflict: {
+  task_id: string;
+  title: string;
+  agent_id: string | null;
+  owner_agent_id: string | null;
+}): string {
+  const agent = conflict.agent_id ?? conflict.owner_agent_id;
+  return `active write task ${conflict.task_id}${
+    agent ? ` claimed by ${agent}` : ''
+  } already owns overlapping scope`;
 }
 
 /**
@@ -417,6 +436,7 @@ export function buildServer(
       if (shouldClaim) {
         const requiredAgentId = envAgentId();
         if (!taskId) throw new Error('coordinator created a task without an id');
+        const localStore = client ? null : requireStore(store);
         claim = client
           ? await requestJson<unknown>(
               client,
@@ -425,7 +445,7 @@ export function buildServer(
               {},
             )
           : {
-              task: requireStore(store).storage.claimTaskById({
+              task: localStore?.storage.claimTaskById({
                 task_id: taskId,
                 agent_id: requiredAgentId,
                 project_id,
@@ -437,6 +457,16 @@ export function buildServer(
           !('task' in claim) ||
           claim.task === null
         ) {
+          if (localStore && plan.access === 'write') {
+            const [conflict] = localStore.storage.findActiveWriteScopeConflicts({
+              project_id,
+              scope: plan.scope,
+              exclude_task_id: taskId,
+            });
+            if (conflict) {
+              throw new Error(`created task ${taskId} could not be claimed: ${writeScopeConflictMessage(conflict)}`);
+            }
+          }
           throw new Error(`created task ${taskId} could not be claimed`);
         }
       }
@@ -597,6 +627,18 @@ export function buildServer(
           !('task' in result) ||
           result.task === null)
       ) {
+        const localStore = client ? null : requireStore(store);
+        const task = localStore?.storage.getTask(id);
+        if (localStore && task?.project_id === project_id && task.access === 'write') {
+          const [conflict] = localStore.storage.findActiveWriteScopeConflicts({
+            project_id,
+            scope: task.scope,
+            exclude_task_id: task.id,
+          });
+          if (conflict) {
+            throw new Error(`task ${id} is not available to this agent: ${writeScopeConflictMessage(conflict)}`);
+          }
+        }
         throw new Error(`task ${id} is not available to this agent`);
       }
       return { content: [{ type: 'text', text: JSON.stringify(result) }] };

@@ -26,6 +26,18 @@ function jsonString(value: unknown): string | null {
   return JSON.stringify(value);
 }
 
+function writeScopeConflictMessage(conflict: {
+  task_id: string;
+  title: string;
+  agent_id: string | null;
+  owner_agent_id: string | null;
+}): string {
+  const agent = conflict.agent_id ?? conflict.owner_agent_id;
+  return `active write task ${conflict.task_id}${
+    agent ? ` claimed by ${agent}` : ''
+  } already owns overlapping scope`;
+}
+
 export function buildApp(store: MemoryStore, loop?: EmbedLoopHandle): Hono {
   const app = new Hono();
 
@@ -222,7 +234,26 @@ export function buildApp(store: MemoryStore, loop?: EmbedLoopHandle): Hono {
       lease_ms: Number(body.lease_ms ?? 10 * 60 * 1000),
     });
 
-    if (!task) return c.json({ error: 'task is not available to this agent' }, 409);
+    if (!task) {
+      const requested = store.storage.getTask(id);
+      if (requested?.project_id === projectId && requested.access === 'write') {
+        const [conflict] = store.storage.findActiveWriteScopeConflicts({
+          project_id: projectId,
+          scope: requested.scope,
+          exclude_task_id: requested.id,
+        });
+        if (conflict) {
+          return c.json(
+            {
+              error: writeScopeConflictMessage(conflict),
+              conflict,
+            },
+            409,
+          );
+        }
+      }
+      return c.json({ error: 'task is not available to this agent' }, 409);
+    }
     return c.json({ task });
   });
 
