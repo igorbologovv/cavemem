@@ -243,4 +243,311 @@ describe('Storage', () => {
     expect(storage.countEmbeddings({ model: 'm', dim: 1 })).toBe(1);
     expect(storage.countEmbeddings({ model: 'm', dim: 2 })).toBe(0);
   });
+
+  it('claims a specific low-priority task even when higher-priority work exists', () => {
+    storage.createTask({
+      id: 'high',
+      project_id: 'project-a',
+      title: 'High priority',
+      description: 'Unrelated work',
+      priority: 10,
+    });
+    storage.createTask({
+      id: 'review',
+      project_id: 'project-a',
+      title: 'Review',
+      description: 'Target review',
+      mode: 'parallel_review',
+      access: 'read_only',
+      max_claims: 3,
+      required_results: 3,
+      priority: 0,
+    });
+
+    const claimed = storage.claimTaskById({
+      task_id: 'review',
+      project_id: 'project-a',
+      agent_id: 'agent-a',
+    });
+
+    expect(claimed?.id).toBe('review');
+    expect(storage.getTask('high')?.status).toBe('todo');
+    expect(storage.listTaskClaims('review')).toMatchObject([
+      { agent_id: 'agent-a', status: 'claimed' },
+    ]);
+  });
+
+  it('reuses a released claim row for the same task and agent', () => {
+    storage.createTask({
+      id: 'review',
+      project_id: 'project-a',
+      title: 'Review',
+      description: 'Target review',
+      mode: 'parallel_review',
+      access: 'read_only',
+      max_claims: 2,
+      required_results: 2,
+    });
+    storage.claimTaskById({
+      task_id: 'review',
+      project_id: 'project-a',
+      agent_id: 'agent-a',
+    });
+    const originalClaimId = storage.listTaskClaims('review')[0]?.id;
+    expect(
+      storage.releaseTask({
+        id: 'review',
+        project_id: 'project-a',
+        agent_id: 'agent-a',
+      }),
+    ).not.toBeNull();
+
+    storage.claimTaskById({
+      task_id: 'review',
+      project_id: 'project-a',
+      agent_id: 'agent-a',
+    });
+
+    expect(storage.listTaskClaims('review')).toMatchObject([
+      { id: originalClaimId, agent_id: 'agent-a', status: 'claimed' },
+    ]);
+  });
+
+  it('rejects completion without an active claim and leaves the task unchanged', () => {
+    storage.createTask({
+      id: 'task-a',
+      project_id: 'project-a',
+      title: 'Task',
+      description: 'Protected task',
+    });
+
+    expect(
+      storage.completeTask({
+        id: 'task-a',
+        project_id: 'project-a',
+        agent_id: 'agent-a',
+        result: 'not allowed',
+      }),
+    ).toBeNull();
+    expect(storage.getTask('task-a')).toMatchObject({ status: 'todo', result: null });
+    expect(storage.listTaskClaims('task-a')).toEqual([]);
+  });
+
+  it('prevents another agent or project from mutating an active task', () => {
+    storage.createTask({
+      id: 'task-a',
+      project_id: 'project-a',
+      title: 'Task',
+      description: 'Protected task',
+    });
+    storage.claimTaskById({
+      task_id: 'task-a',
+      project_id: 'project-a',
+      agent_id: 'owner',
+    });
+
+    expect(
+      storage.updateTask('task-a', {
+        project_id: 'project-a',
+        agent_id: 'intruder',
+        status: 'blocked',
+      }),
+    ).toBeNull();
+    expect(
+      storage.completeTask({
+        id: 'task-a',
+        project_id: 'project-b',
+        agent_id: 'owner',
+      }),
+    ).toBeNull();
+    expect(
+      storage.releaseTask({
+        id: 'task-a',
+        project_id: 'project-a',
+        agent_id: 'intruder',
+      }),
+    ).toBeNull();
+    expect(storage.getTask('task-a')).toMatchObject({
+      status: 'in_progress',
+      owner_agent_id: 'owner',
+    });
+    expect(storage.listTaskClaims('task-a')).toMatchObject([
+      { agent_id: 'owner', status: 'claimed' },
+    ]);
+  });
+
+  it('finishes a parallel review only after the required submitted claims', () => {
+    storage.createTask({
+      id: 'review',
+      project_id: 'project-a',
+      title: 'Review',
+      description: 'Two independent reviews',
+      mode: 'parallel_review',
+      access: 'read_only',
+      max_claims: 3,
+      required_results: 2,
+    });
+    storage.claimTaskById({
+      task_id: 'review',
+      project_id: 'project-a',
+      agent_id: 'agent-a',
+    });
+    storage.claimTaskById({
+      task_id: 'review',
+      project_id: 'project-a',
+      agent_id: 'agent-b',
+    });
+
+    expect(
+      storage.completeTask({
+        id: 'review',
+        project_id: 'project-a',
+        agent_id: 'agent-a',
+        result: 'first',
+      }),
+    ).toMatchObject({ status: 'in_progress' });
+    const claims = storage.listTaskClaims('review');
+    expect(claims).toHaveLength(2);
+    expect(claims).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          agent_id: 'agent-a',
+          status: 'submitted',
+          result: 'first',
+        }),
+        expect.objectContaining({ agent_id: 'agent-b', status: 'claimed' }),
+      ]),
+    );
+
+    expect(
+      storage.completeTask({
+        id: 'review',
+        project_id: 'project-a',
+        agent_id: 'agent-b',
+        result: 'second',
+      }),
+    ).toMatchObject({ status: 'done' });
+  });
+
+  it('caps the completion threshold for legacy parallel tasks', () => {
+    storage.createTask({
+      id: 'legacy-review',
+      project_id: 'project-a',
+      title: 'Legacy review',
+      description: 'Required results exceeds max claims',
+      mode: 'parallel_review',
+      access: 'read_only',
+      max_claims: 2,
+      required_results: 2,
+    });
+    const db = (
+      storage as unknown as {
+        db: { prepare(sql: string): { run(...args: unknown[]): unknown } };
+      }
+    ).db;
+    db.prepare('UPDATE tasks SET required_results = 3 WHERE id = ?').run('legacy-review');
+
+    for (const agent_id of ['agent-a', 'agent-b']) {
+      storage.claimTaskById({
+        task_id: 'legacy-review',
+        project_id: 'project-a',
+        agent_id,
+      });
+    }
+
+    expect(
+      storage.completeTask({
+        id: 'legacy-review',
+        project_id: 'project-a',
+        agent_id: 'agent-a',
+        result: 'first',
+      }),
+    ).toMatchObject({ status: 'in_progress' });
+    expect(
+      storage.completeTask({
+        id: 'legacy-review',
+        project_id: 'project-a',
+        agent_id: 'agent-b',
+        result: 'second',
+      }),
+    ).toMatchObject({ status: 'done' });
+  });
+
+  it('closes surplus parallel claims and prevents submissions after completion', () => {
+    storage.createTask({
+      id: 'review-with-surplus',
+      project_id: 'project-a',
+      title: 'Review',
+      description: 'Two results from three claims',
+      mode: 'parallel_review',
+      access: 'read_only',
+      max_claims: 3,
+      required_results: 2,
+    });
+    for (const agent_id of ['agent-a', 'agent-b', 'agent-c']) {
+      storage.claimTaskById({
+        task_id: 'review-with-surplus',
+        project_id: 'project-a',
+        agent_id,
+      });
+    }
+
+    storage.completeTask({
+      id: 'review-with-surplus',
+      project_id: 'project-a',
+      agent_id: 'agent-a',
+      result: 'first',
+    });
+    expect(
+      storage.completeTask({
+        id: 'review-with-surplus',
+        project_id: 'project-a',
+        agent_id: 'agent-b',
+        result: 'second',
+      }),
+    ).toMatchObject({ status: 'done' });
+
+    expect(storage.listTaskClaims('review-with-surplus')).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ agent_id: 'agent-a', status: 'submitted' }),
+        expect.objectContaining({ agent_id: 'agent-b', status: 'submitted' }),
+        expect.objectContaining({ agent_id: 'agent-c', status: 'released' }),
+      ]),
+    );
+    expect(storage.listAgents('project-a')).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: 'agent-a',
+          status: 'idle',
+          current_task_id: null,
+        }),
+        expect.objectContaining({
+          id: 'agent-b',
+          status: 'idle',
+          current_task_id: null,
+        }),
+        expect.objectContaining({
+          id: 'agent-c',
+          status: 'idle',
+          current_task_id: null,
+        }),
+      ]),
+    );
+    expect(
+      storage.completeTask({
+        id: 'review-with-surplus',
+        project_id: 'project-a',
+        agent_id: 'agent-c',
+        result: 'late',
+      }),
+    ).toBeNull();
+    expect(storage.listTaskEvents('review-with-surplus')).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          agent_id: 'agent-c',
+          kind: 'released',
+        }),
+      ]),
+    );
+  });
 });

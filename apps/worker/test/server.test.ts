@@ -93,4 +93,89 @@ describe('worker HTTP', () => {
     const res = await app.request('/sessions/does-not-exist');
     expect(res.status).toBe(404);
   });
+
+  it('claims an exact task id instead of higher-priority queued work', async () => {
+    store.storage.createTask({
+      id: 'high',
+      project_id: 'project-a',
+      title: 'High priority',
+      description: 'Unrelated work',
+      priority: 10,
+    });
+    store.storage.createTask({
+      id: 'review/one',
+      project_id: 'project-a',
+      title: 'Review',
+      description: 'Target review',
+      mode: 'parallel_review',
+      access: 'read_only',
+      max_claims: 3,
+      required_results: 3,
+    });
+
+    const res = await app.request('/api/tasks/review%2Fone/claim', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-cavemem-agent-id': 'agent-a',
+        'x-cavemem-project-id': 'project-a',
+      },
+      body: '{}',
+    });
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({
+      task: { id: 'review/one', status: 'in_progress' },
+    });
+    expect(store.storage.getTask('high')?.status).toBe('todo');
+  });
+
+  it('rejects cross-agent and cross-project task mutations', async () => {
+    store.storage.createTask({
+      id: 'task-a',
+      project_id: 'project-a',
+      title: 'Task',
+      description: 'Protected task',
+    });
+    store.storage.claimTaskById({
+      task_id: 'task-a',
+      project_id: 'project-a',
+      agent_id: 'owner',
+    });
+
+    const intruderHeaders = {
+      'content-type': 'application/json',
+      'x-cavemem-agent-id': 'intruder',
+      'x-cavemem-project-id': 'project-a',
+    };
+    const otherProjectHeaders = {
+      'content-type': 'application/json',
+      'x-cavemem-agent-id': 'owner',
+      'x-cavemem-project-id': 'project-b',
+    };
+
+    const update = await app.request('/api/tasks/task-a', {
+      method: 'PATCH',
+      headers: intruderHeaders,
+      body: JSON.stringify({ status: 'blocked' }),
+    });
+    const complete = await app.request('/api/tasks/task-a/complete', {
+      method: 'POST',
+      headers: otherProjectHeaders,
+      body: JSON.stringify({ result: 'not allowed' }),
+    });
+    const release = await app.request('/api/tasks/task-a/release', {
+      method: 'POST',
+      headers: intruderHeaders,
+      body: '{}',
+    });
+
+    expect(update.status).toBe(409);
+    expect(complete.status).toBe(409);
+    expect(release.status).toBe(409);
+    expect(store.storage.getTask('task-a')).toMatchObject({
+      status: 'in_progress',
+      owner_agent_id: 'owner',
+    });
+  });
 });

@@ -56,7 +56,9 @@ function activeTaskGuidance(store: MemoryStore, input: HookInput): string {
       '## Cavemem coordination',
       `You are ${agentId} in project ${projectId}.`,
       'No active task is currently claimed by this agent.',
-      'Before project work, use cavemem.claim_task to claim a task and follow its contract.',
+      'If the user asks for project work, call cavemem.ask with their plain-language request, then follow the created task contract.',
+      'Do not ask the user for YAML, JSON, or internal task fields.',
+      'Use cavemem.claim_task only when the user has not supplied a project-work request and an existing queued task should be claimed.',
     ].join('\n');
   }
 

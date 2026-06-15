@@ -58,6 +58,7 @@ describe('MCP server', () => {
   it('lists the cavemem tools', async () => {
     const { tools } = await client.listTools();
     expect(tools.map((t) => t.name).sort()).toEqual([
+      'ask',
       'claim_task',
       'complete_task',
       'create_task',
@@ -129,6 +130,305 @@ describe('MCP server', () => {
       arguments: { ids: [] },
     });
     expect(res.isError).toBe(true);
+  });
+
+  it('ask creates and claims an inferred exclusive write task', async () => {
+    vi.stubEnv('CAVEMEM_AGENT_ID', 'agent-a');
+    vi.stubEnv('CAVEMEM_PROJECT_ID', 'project-a');
+
+    const result = await client.callTool({
+      name: 'ask',
+      arguments: { request: 'Add endpoint mode tests for MCP server' },
+    });
+    const payload = JSON.parse(toolText(result)) as {
+      plan: Record<string, unknown>;
+      task: { id: string };
+      claim: { task: { id: string; status: string } };
+    };
+
+    expect(payload.plan).toMatchObject({
+      kind: 'test',
+      access: 'write',
+      mode: 'exclusive',
+      max_claims: 1,
+      required_results: 1,
+      scope: ['apps/mcp-server/**', 'apps/worker/**', 'packages/hooks/**', 'packages/storage/**'],
+    });
+    expect(payload.claim.task.id).toBe(payload.task.id);
+    expect(payload.claim.task.status).toBe('in_progress');
+  });
+
+  it('ask honors explicit read-only review constraints', async () => {
+    vi.stubEnv('CAVEMEM_AGENT_ID', 'agent-a');
+    vi.stubEnv('CAVEMEM_PROJECT_ID', 'project-a');
+
+    const result = await client.callTool({
+      name: 'ask',
+      arguments: { request: 'Review this read-only, do not edit files' },
+    });
+    const payload = JSON.parse(toolText(result)) as { plan: Record<string, unknown> };
+
+    expect(payload.plan).toMatchObject({
+      kind: 'review',
+      access: 'read_only',
+      mode: 'exclusive',
+    });
+  });
+
+  it('ask lets explicit read-only review constraints override write keywords', async () => {
+    vi.stubEnv('CAVEMEM_AGENT_ID', 'agent-a');
+    vi.stubEnv('CAVEMEM_PROJECT_ID', 'project-a');
+
+    const result = await client.callTool({
+      name: 'ask',
+      arguments: { request: 'Read-only review; do not edit; check update behavior' },
+    });
+    const payload = JSON.parse(toolText(result)) as {
+      plan: Record<string, unknown>;
+      claim: unknown;
+    };
+
+    expect(payload.plan).toMatchObject({
+      kind: 'review',
+      access: 'read_only',
+      mode: 'exclusive',
+    });
+    expect(payload.claim).toBeNull();
+  });
+
+  it('ask treats inspection without editing as read-only', async () => {
+    vi.stubEnv('CAVEMEM_AGENT_ID', 'agent-a');
+    vi.stubEnv('CAVEMEM_PROJECT_ID', 'project-a');
+
+    const result = await client.callTool({
+      name: 'ask',
+      arguments: { request: 'Inspect task coordination safety without editing' },
+    });
+    const payload = JSON.parse(toolText(result)) as { plan: Record<string, unknown> };
+
+    expect(payload.plan).toMatchObject({
+      kind: 'review',
+      access: 'read_only',
+      mode: 'exclusive',
+    });
+  });
+
+  it('ask infers adding tests as exclusive write test work', async () => {
+    vi.stubEnv('CAVEMEM_AGENT_ID', 'agent-a');
+    vi.stubEnv('CAVEMEM_PROJECT_ID', 'project-a');
+
+    const result = await client.callTool({
+      name: 'ask',
+      arguments: { request: 'Add tests for MCP server' },
+    });
+    const payload = JSON.parse(toolText(result)) as {
+      plan: Record<string, unknown>;
+      claim: { task: { status: string } };
+    };
+
+    expect(payload.plan).toMatchObject({
+      kind: 'test',
+      access: 'write',
+      mode: 'exclusive',
+    });
+    expect(payload.claim.task.status).toBe('in_progress');
+  });
+
+  it('ask does not interpret parallel implementation language as parallel review', async () => {
+    vi.stubEnv('CAVEMEM_AGENT_ID', 'agent-a');
+    vi.stubEnv('CAVEMEM_PROJECT_ID', 'project-a');
+
+    const result = await client.callTool({
+      name: 'ask',
+      arguments: { request: 'Implement parallel processing support' },
+    });
+    const payload = JSON.parse(toolText(result)) as {
+      plan: Record<string, unknown>;
+      claim: { task: { status: string } };
+    };
+
+    expect(payload.plan).toMatchObject({
+      kind: 'implementation',
+      access: 'write',
+      mode: 'exclusive',
+      max_claims: 1,
+      required_results: 1,
+    });
+    expect(payload.claim.task.status).toBe('in_progress');
+  });
+
+  it('ask infers test-only investigation as read-only test work', async () => {
+    vi.stubEnv('CAVEMEM_AGENT_ID', 'agent-a');
+    vi.stubEnv('CAVEMEM_PROJECT_ID', 'project-a');
+
+    const result = await client.callTool({
+      name: 'ask',
+      arguments: { request: 'Run a test-only investigation of task coordination' },
+    });
+    const payload = JSON.parse(toolText(result)) as {
+      plan: Record<string, unknown>;
+      claim: unknown;
+    };
+
+    expect(payload.plan).toMatchObject({
+      kind: 'test',
+      access: 'read_only',
+      mode: 'exclusive',
+    });
+    expect(payload.claim).toBeNull();
+  });
+
+  it('ask lets test-only execution override incidental write keywords', async () => {
+    vi.stubEnv('CAVEMEM_AGENT_ID', 'agent-a');
+    vi.stubEnv('CAVEMEM_PROJECT_ID', 'project-a');
+
+    const result = await client.callTool({
+      name: 'ask',
+      arguments: { request: 'Run tests only; check update behavior' },
+    });
+    const payload = JSON.parse(toolText(result)) as {
+      plan: Record<string, unknown>;
+      claim: unknown;
+    };
+
+    expect(payload.plan).toMatchObject({
+      kind: 'test',
+      access: 'read_only',
+      mode: 'exclusive',
+    });
+    expect(payload.claim).toBeNull();
+  });
+
+  it('ask infers independent reviewers as parallel read-only review work', async () => {
+    vi.stubEnv('CAVEMEM_AGENT_ID', 'agent-a');
+    vi.stubEnv('CAVEMEM_PROJECT_ID', 'project-a');
+
+    const result = await client.callTool({
+      name: 'ask',
+      arguments: { request: 'Ask independent reviewers to check task coordination safety' },
+    });
+    const payload = JSON.parse(toolText(result)) as {
+      plan: Record<string, unknown>;
+      task: { status: string };
+      claim: unknown;
+    };
+
+    expect(payload.plan).toMatchObject({
+      kind: 'review',
+      access: 'read_only',
+      mode: 'parallel_review',
+      max_claims: 3,
+      required_results: 3,
+    });
+    expect(payload.task.status).toBe('todo');
+    expect(payload.claim).toBeNull();
+  });
+
+  it('ask creates an unclaimed three-agent parallel review task', async () => {
+    vi.stubEnv('CAVEMEM_AGENT_ID', 'agent-a');
+    vi.stubEnv('CAVEMEM_PROJECT_ID', 'project-a');
+
+    const result = await client.callTool({
+      name: 'ask',
+      arguments: { request: 'Ask three agents to review task coordination safety' },
+    });
+    const payload = JSON.parse(toolText(result)) as {
+      plan: Record<string, unknown>;
+      task: { status: string };
+      claim: unknown;
+    };
+
+    expect(payload.plan).toMatchObject({
+      kind: 'review',
+      access: 'read_only',
+      mode: 'parallel_review',
+      max_claims: 3,
+      required_results: 3,
+    });
+    expect(payload.task.status).toBe('todo');
+    expect(payload.claim).toBeNull();
+  });
+
+  it('ask claims an exact review task when asked to perform the review now', async () => {
+    vi.stubEnv('CAVEMEM_AGENT_ID', 'agent-a');
+    vi.stubEnv('CAVEMEM_PROJECT_ID', 'project-a');
+
+    const result = await client.callTool({
+      name: 'ask',
+      arguments: { request: 'Perform the review of task coordination safety now' },
+    });
+    const payload = JSON.parse(toolText(result)) as {
+      task: { id: string };
+      claim: { task: { id: string } };
+    };
+
+    expect(payload.claim.task.id).toBe(payload.task.id);
+  });
+
+  it('claims and submits an ask-created review by exact id', async () => {
+    vi.stubEnv('CAVEMEM_AGENT_ID', 'agent-a');
+    vi.stubEnv('CAVEMEM_PROJECT_ID', 'project-a');
+
+    const highPriority = await client.callTool({
+      name: 'create_task',
+      arguments: {
+        id: 'high',
+        title: 'High priority',
+        description: 'Unrelated work',
+        priority: 10,
+      },
+    });
+    expect(highPriority.isError).not.toBe(true);
+
+    const asked = await client.callTool({
+      name: 'ask',
+      arguments: { request: 'Ask three agents to review task coordination safety' },
+    });
+    const payload = JSON.parse(toolText(asked)) as { task: { id: string } };
+
+    const claimed = await client.callTool({
+      name: 'claim_task',
+      arguments: { id: payload.task.id },
+    });
+    expect(JSON.parse(toolText(claimed))).toMatchObject({
+      task: { id: payload.task.id, status: 'in_progress' },
+    });
+
+    const completed = await client.callTool({
+      name: 'complete_task',
+      arguments: { id: payload.task.id, result: 'review result' },
+    });
+    expect(JSON.parse(toolText(completed))).toMatchObject({ status: 'in_progress' });
+
+    const claims = await client.callTool({
+      name: 'task_claims',
+      arguments: { id: payload.task.id },
+    });
+    expect(JSON.parse(toolText(claims))).toMatchObject([
+      { agent_id: 'agent-a', status: 'submitted', result: 'review result' },
+    ]);
+
+    const tasks = await client.callTool({ name: 'list_tasks', arguments: { status: 'todo' } });
+    expect(JSON.parse(toolText(tasks))).toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: 'high' })]),
+    );
+  });
+
+  it('rejects complete_task when the caller has no active claim', async () => {
+    vi.stubEnv('CAVEMEM_AGENT_ID', 'agent-a');
+    vi.stubEnv('CAVEMEM_PROJECT_ID', 'project-a');
+    await client.callTool({
+      name: 'create_task',
+      arguments: { id: 'task-a', title: 'Task', description: 'Unclaimed task' },
+    });
+
+    const result = await client.callTool({
+      name: 'complete_task',
+      arguments: { id: 'task-a', result: 'not allowed' },
+    });
+
+    expect(result.isError).toBe(true);
+    expect(toolText(result)).toContain('not actively claimed');
   });
 });
 
@@ -252,6 +552,109 @@ describe('MCP endpoint mode', () => {
         body: { status: 'blocked', progress: 'waiting' },
       },
     ]);
+  });
+
+  it('ask forwards identity headers while creating and claiming endpoint tasks', async () => {
+    vi.stubEnv('CAVEMEM_AGENT_ID', 'agent-a');
+    vi.stubEnv('CAVEMEM_PROJECT_ID', 'project-a');
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ id: 'task-a', status: 'todo' }), { status: 201 }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ task: { id: 'task-a', status: 'in_progress' } }), {
+          status: 200,
+        }),
+      );
+    vi.stubGlobal('fetch', fetchMock);
+
+    await client.callTool({
+      name: 'ask',
+      arguments: { request: 'Fix claim_task 500 after release' },
+    });
+
+    expect(fetchMock.mock.calls).toEqual([
+      [
+        'https://coordinator.test/api/tasks',
+        {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            'x-cavemem-agent-id': 'agent-a',
+            'x-cavemem-project-id': 'project-a',
+          },
+          body: JSON.stringify({
+            project_id: 'project-a',
+            title: 'Fix claim_task 500 after release',
+            description: 'Fix claim_task 500 after release',
+            kind: 'implementation',
+            access: 'write',
+            mode: 'exclusive',
+            scope: ['packages/**', 'apps/**'],
+            max_claims: 1,
+            required_results: 1,
+            created_by_agent_id: 'agent-a',
+          }),
+        },
+      ],
+      [
+        'https://coordinator.test/api/tasks/task-a/claim',
+        {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            'x-cavemem-agent-id': 'agent-a',
+            'x-cavemem-project-id': 'project-a',
+          },
+          body: JSON.stringify({}),
+        },
+      ],
+    ]);
+  });
+
+  it('forwards claim_task id to the exact-task claim endpoint', async () => {
+    vi.stubEnv('CAVEMEM_AGENT_ID', 'agent-a');
+    vi.stubEnv('CAVEMEM_PROJECT_ID', 'project-a');
+    const fetchMock = vi.fn<typeof fetch>(
+      async () =>
+        new Response(JSON.stringify({ task: { id: 'review/one', status: 'in_progress' } }), {
+          status: 200,
+        }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    await client.callTool({
+      name: 'claim_task',
+      arguments: { id: 'review/one', lease_ms: 5000 },
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      'https://coordinator.test/api/tasks/review%2Fone/claim',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({ lease_ms: 5000 }),
+      }),
+    );
+  });
+
+  it('ask returns useful coordinator failures as MCP tool errors', async () => {
+    vi.stubEnv('CAVEMEM_AGENT_ID', 'agent-a');
+    vi.stubEnv('CAVEMEM_PROJECT_ID', 'project-a');
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response('task creation unavailable', { status: 503 })),
+    );
+
+    const result = await client.callTool({
+      name: 'ask',
+      arguments: { request: 'Add endpoint mode tests for MCP server' },
+    });
+
+    expect(result.isError).toBe(true);
+    expect(toolText(result)).toContain(
+      'endpoint /api/tasks failed (503): task creation unavailable',
+    );
   });
 
   it('returns endpoint failures as MCP tool errors', async () => {

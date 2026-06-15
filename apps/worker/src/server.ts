@@ -5,8 +5,8 @@ import { pathToFileURL } from 'node:url';
 import { expand } from '@cavemem/compress';
 import { type Settings, loadSettings, resolveDataDir } from '@cavemem/config';
 import { MemoryStore } from '@cavemem/core';
-import { type HookName, runHook } from '@cavemem/hooks';
 import { createEmbedder } from '@cavemem/embedding';
+import { type HookName, runHook } from '@cavemem/hooks';
 import { serve } from '@hono/node-server';
 import { Hono } from 'hono';
 import { type EmbedLoopHandle, startEmbedLoop, stateFilePath } from './embed-loop.js';
@@ -20,17 +20,10 @@ const HOOK_NAMES = new Set<HookName>([
   'session-end',
 ]);
 
-
 function jsonString(value: unknown): string | null {
   if (typeof value === 'string') return value;
   if (value == null) return null;
   return JSON.stringify(value);
-}
-
-function requireHeader(c: { req: { header(name: string): string | undefined } }, name: string): string {
-  const value = c.req.header(name);
-  if (!value) throw new Error(`missing ${name}`);
-  return value;
 }
 
 export function buildApp(store: MemoryStore, loop?: EmbedLoopHandle): Hono {
@@ -57,7 +50,9 @@ export function buildApp(store: MemoryStore, loop?: EmbedLoopHandle): Hono {
     }
 
     const existingMetadata =
-      typeof input.metadata === 'object' && input.metadata !== null && !Array.isArray(input.metadata)
+      typeof input.metadata === 'object' &&
+      input.metadata !== null &&
+      !Array.isArray(input.metadata)
         ? (input.metadata as Record<string, unknown>)
         : {};
 
@@ -129,8 +124,7 @@ export function buildApp(store: MemoryStore, loop?: EmbedLoopHandle): Hono {
         ? body.kind
         : undefined;
 
-    const access =
-      body.access === 'read_only' || body.access === 'write' ? body.access : undefined;
+    const access = body.access === 'read_only' || body.access === 'write' ? body.access : undefined;
 
     const createTaskInput: Parameters<typeof store.storage.createTask>[0] = {
       project_id: projectId,
@@ -140,7 +134,7 @@ export function buildApp(store: MemoryStore, loop?: EmbedLoopHandle): Hono {
       created_by_agent_id:
         typeof body.created_by_agent_id === 'string'
           ? body.created_by_agent_id
-          : c.req.header('x-cavemem-agent-id') ?? null,
+          : (c.req.header('x-cavemem-agent-id') ?? null),
     };
 
     if (typeof body.id === 'string') createTaskInput.id = body.id;
@@ -191,8 +185,8 @@ export function buildApp(store: MemoryStore, loop?: EmbedLoopHandle): Hono {
       body = {};
     }
 
-    const agentId = String(body.agent_id ?? c.req.header('x-cavemem-agent-id') ?? '');
-    const projectId = String(body.project_id ?? c.req.header('x-cavemem-project-id') ?? '');
+    const agentId = c.req.header('x-cavemem-agent-id') ?? '';
+    const projectId = c.req.header('x-cavemem-project-id') ?? '';
 
     if (!agentId) return c.json({ error: 'missing agent_id' }, 400);
     if (!projectId) return c.json({ error: 'missing project_id' }, 400);
@@ -207,6 +201,31 @@ export function buildApp(store: MemoryStore, loop?: EmbedLoopHandle): Hono {
     return c.json({ task });
   });
 
+  app.post('/api/tasks/:id/claim', async (c) => {
+    const id = c.req.param('id');
+    let body: Record<string, unknown> = {};
+    try {
+      body = await c.req.json();
+    } catch {
+      body = {};
+    }
+
+    const agentId = c.req.header('x-cavemem-agent-id') ?? '';
+    const projectId = c.req.header('x-cavemem-project-id') ?? '';
+    if (!agentId) return c.json({ error: 'missing agent_id' }, 400);
+    if (!projectId) return c.json({ error: 'missing project_id' }, 400);
+
+    const task = store.storage.claimTaskById({
+      task_id: id,
+      agent_id: agentId,
+      project_id: projectId,
+      lease_ms: Number(body.lease_ms ?? 10 * 60 * 1000),
+    });
+
+    if (!task) return c.json({ error: 'task is not available to this agent' }, 409);
+    return c.json({ task });
+  });
+
   app.patch('/api/tasks/:id', async (c) => {
     const id = c.req.param('id');
 
@@ -217,8 +236,10 @@ export function buildApp(store: MemoryStore, loop?: EmbedLoopHandle): Hono {
       return c.json({ error: 'invalid json body' }, 400);
     }
 
-    const agentId = c.req.header('x-cavemem-agent-id');
-    const projectId = c.req.header('x-cavemem-project-id') ?? String(body.project_id ?? '');
+    const agentId = c.req.header('x-cavemem-agent-id') ?? '';
+    const projectId = c.req.header('x-cavemem-project-id') ?? '';
+    if (!agentId) return c.json({ error: 'missing agent_id' }, 400);
+    if (!projectId) return c.json({ error: 'missing project_id' }, 400);
 
     const rawStatus = body.status;
     const status =
@@ -235,20 +256,17 @@ export function buildApp(store: MemoryStore, loop?: EmbedLoopHandle): Hono {
       content?: string | null;
       result?: string | null;
       lease_ms?: number;
-      agent_id?: string;
-      project_id?: string;
-    } = {};
+      agent_id: string;
+      project_id: string;
+    } = { agent_id: agentId, project_id: projectId };
 
     if (status !== undefined) updateTaskInput.status = status;
     updateTaskInput.content = jsonString(body.content ?? body.progress);
     if (body.result !== undefined) updateTaskInput.result = jsonString(body.result);
     if (body.lease_ms !== undefined) updateTaskInput.lease_ms = Number(body.lease_ms);
-    if (agentId !== undefined) updateTaskInput.agent_id = agentId;
-    if (projectId) updateTaskInput.project_id = projectId;
-
     const task = store.storage.updateTask(id, updateTaskInput);
 
-    if (!task) return c.json({ error: 'task not found' }, 404);
+    if (!task) return c.json({ error: 'task is not actively claimed by this agent' }, 409);
     return c.json(task);
   });
 
@@ -262,8 +280,8 @@ export function buildApp(store: MemoryStore, loop?: EmbedLoopHandle): Hono {
       body = {};
     }
 
-    const agentId = String(body.agent_id ?? c.req.header('x-cavemem-agent-id') ?? '');
-    const projectId = String(body.project_id ?? c.req.header('x-cavemem-project-id') ?? '');
+    const agentId = c.req.header('x-cavemem-agent-id') ?? '';
+    const projectId = c.req.header('x-cavemem-project-id') ?? '';
 
     if (!agentId) return c.json({ error: 'missing agent_id' }, 400);
     if (!projectId) return c.json({ error: 'missing project_id' }, 400);
@@ -275,7 +293,7 @@ export function buildApp(store: MemoryStore, loop?: EmbedLoopHandle): Hono {
       result: jsonString(body.result),
     });
 
-    if (!task) return c.json({ error: 'task not found' }, 404);
+    if (!task) return c.json({ error: 'task is not actively claimed by this agent' }, 409);
     return c.json(task);
   });
 
@@ -289,8 +307,8 @@ export function buildApp(store: MemoryStore, loop?: EmbedLoopHandle): Hono {
       body = {};
     }
 
-    const agentId = String(body.agent_id ?? c.req.header('x-cavemem-agent-id') ?? '');
-    const projectId = String(body.project_id ?? c.req.header('x-cavemem-project-id') ?? '');
+    const agentId = c.req.header('x-cavemem-agent-id') ?? '';
+    const projectId = c.req.header('x-cavemem-project-id') ?? '';
 
     if (!agentId) return c.json({ error: 'missing agent_id' }, 400);
     if (!projectId) return c.json({ error: 'missing project_id' }, 400);
@@ -302,7 +320,7 @@ export function buildApp(store: MemoryStore, loop?: EmbedLoopHandle): Hono {
       reason: jsonString(body.reason),
     });
 
-    if (!task) return c.json({ error: 'task not found' }, 404);
+    if (!task) return c.json({ error: 'task is not actively claimed by this agent' }, 409);
     return c.json(task);
   });
 
@@ -316,7 +334,6 @@ export function buildApp(store: MemoryStore, loop?: EmbedLoopHandle): Hono {
     const limit = Number(c.req.query('limit') ?? 100);
     return c.json(store.storage.listTaskEvents(id, limit));
   });
-
 
   app.get('/api/state', (c) => {
     if (!loop) return c.json({ running: false });

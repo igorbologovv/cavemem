@@ -30,7 +30,6 @@ async function getJson<T>(client: HttpClient, path: string): Promise<T> {
   return JSON.parse(text) as T;
 }
 
-
 async function requestJson<T>(
   client: HttpClient,
   method: 'POST' | 'PATCH',
@@ -74,7 +73,6 @@ function envProjectId(): string {
   return value;
 }
 
-
 const taskKindSchema = z.enum(['review', 'implementation', 'investigation', 'test', 'docs']);
 const taskAccessSchema = z.enum(['read_only', 'write']);
 const taskModeSchema = z.enum(['exclusive', 'parallel_review']);
@@ -84,6 +82,156 @@ type TaskKind = z.infer<typeof taskKindSchema>;
 type TaskAccess = z.infer<typeof taskAccessSchema>;
 type TaskMode = z.infer<typeof taskModeSchema>;
 type TaskStatus = z.infer<typeof taskStatusSchema>;
+
+type TaskPlan = {
+  title: string;
+  description: string;
+  kind: TaskKind;
+  access: TaskAccess;
+  mode: TaskMode;
+  scope: string[];
+  max_claims: number;
+  required_results: number;
+};
+
+function shouldPerformReviewNow(request: string): boolean {
+  return includesAny(request.toLowerCase(), [
+    /\breview this\b/,
+    /\bperform (?:this|the) review\b/,
+    /\bperform the review now\b/,
+  ]);
+}
+
+function includesAny(request: string, patterns: RegExp[]): boolean {
+  return patterns.some((pattern) => pattern.test(request));
+}
+
+function inferTaskPlan(rawRequest: string): TaskPlan {
+  const request = rawRequest.trim().replace(/\s+/g, ' ');
+  const lower = request.toLowerCase();
+  const independentReview = /\bindependent reviewers?\b/.test(lower);
+  const parallelReviewRequested = includesAny(lower, [
+    /\bthree agents\b/,
+    /\b3 agents\b/,
+    /\bmultiple agents\b/,
+    /\bparallel reviews?\b/,
+    /\bindependent reviewers?\b/,
+  ]);
+  const explicitReadOnly = includesAny(lower, [
+    /\bread[\s-]?only\b/,
+    /\bdo not edit\b/,
+    /\bdon't edit\b/,
+    /\bno file edits?\b/,
+    /\binspect only\b/,
+    /\bwithout editing\b/,
+    /\bwithout (?:changing|modifying) files?\b/,
+  ]);
+  const writeRequested = includesAny(lower, [
+    /\bimplement\b/,
+    /\bfix\b/,
+    /\badd\b/,
+    /\bupdate\b/,
+    /\brefactor\b/,
+    /\bwrite\b/,
+    /\bcreate\b/,
+    /\bchange\b/,
+    /\bmodify\b/,
+  ]);
+  const testOnly = includesAny(lower, [
+    /\btest[\s-]?only\b/,
+    /\brun (?:the )?tests? only\b/,
+    /\bonly run (?:the )?tests?\b/,
+  ]);
+  const testWork = includesAny(lower, [/\btest[\s-]?only\b/, /\btests?\b/, /\btesting\b/]);
+  const reviewWork = includesAny(lower, [
+    /\breview\b/,
+    /\breviewers?\b/,
+    /\baudit\b/,
+    /\binspect\b/,
+    /\bcheck safety\b/,
+    /\bsafety\b/,
+  ]);
+  const investigationWork = includesAny(lower, [
+    /\binvestigat(?:e|ion)\b/,
+    /\bdiagnose\b/,
+    /\bfind why\b/,
+    /\bexplain\b/,
+    /\bsummarize(?: the)? architecture\b/,
+  ]);
+
+  let kind: TaskKind = 'implementation';
+  let access: TaskAccess = 'write';
+
+  if (testWork) {
+    kind = 'test';
+  } else if (includesAny(lower, [/\bdocs?\b/, /\breadme\b/, /\bdocumentation\b/])) {
+    kind = 'docs';
+  } else if (reviewWork || explicitReadOnly) {
+    kind = 'review';
+  } else if (investigationWork) {
+    kind = 'investigation';
+  }
+
+  if (
+    explicitReadOnly ||
+    testOnly ||
+    independentReview ||
+    ((reviewWork || investigationWork) && !writeRequested)
+  ) {
+    access = 'read_only';
+  }
+
+  const scope = new Set<string>();
+  const endpointMode = /\bendpoint mode\b/.test(lower);
+
+  if (endpointMode) {
+    scope.add('apps/mcp-server/**');
+    scope.add('apps/worker/**');
+    scope.add('packages/hooks/**');
+    scope.add('packages/storage/**');
+  } else {
+    if (/\bmcp server\b/.test(lower)) scope.add('apps/mcp-server/**');
+    if (/\bworker\b/.test(lower) || /\bcoordinator api\b/.test(lower)) {
+      scope.add('apps/worker/**');
+    }
+    if (
+      /\bstorage\b/.test(lower) ||
+      /\bsqlite\b/.test(lower) ||
+      /\bdatabase\b/.test(lower) ||
+      /\bclaims?\b/.test(lower)
+    ) {
+      scope.add('packages/storage/**');
+    }
+    if (
+      /\bhooks?\b/.test(lower) ||
+      /\bsessionstart\b/i.test(request) ||
+      /\bposttooluse\b/i.test(request)
+    ) {
+      scope.add('packages/hooks/**');
+    }
+    if (/\bcli\b/.test(lower)) scope.add('apps/cli/**');
+  }
+
+  if (scope.size === 0) {
+    scope.add('packages/**');
+    scope.add('apps/**');
+  }
+
+  const parallelReview = parallelReviewRequested && kind === 'review' && access === 'read_only';
+  const mode: TaskMode = parallelReview ? 'parallel_review' : 'exclusive';
+  const claimCount = parallelReview ? 3 : 1;
+
+  return {
+    title: request,
+    description: request,
+    kind,
+    access,
+    mode,
+    scope: [...scope],
+    max_claims: claimCount,
+    required_results: claimCount,
+  };
+}
 
 function requireStore(store: MemoryStore | null): MemoryStore {
   if (!store) {
@@ -139,7 +287,11 @@ export function buildServer(
             client,
             `/api/search?q=${encodeURIComponent(query)}&limit=${actualLimit}`,
           )
-        : await requireStore(store).search(query, actualLimit, (await resolveEmbedder()) ?? undefined);
+        : await requireStore(store).search(
+            query,
+            actualLimit,
+            (await resolveEmbedder()) ?? undefined,
+          );
 
       return {
         content: [{ type: 'text', text: JSON.stringify(hits) }],
@@ -188,14 +340,16 @@ export function buildServer(
             client,
             `/api/observations?ids=${encodeURIComponent(ids.join(','))}&expand=${expand}`,
           )
-        : requireStore(store).getObservations(ids, { expand }).map((r) => ({
-            id: r.id,
-            session_id: r.session_id,
-            kind: r.kind,
-            ts: r.ts,
-            content: r.content,
-            metadata: r.metadata,
-          }));
+        : requireStore(store)
+            .getObservations(ids, { expand })
+            .map((r) => ({
+              id: r.id,
+              session_id: r.session_id,
+              kind: r.kind,
+              ts: r.ts,
+              content: r.content,
+              metadata: r.metadata,
+            }));
 
       return { content: [{ type: 'text', text: JSON.stringify(payload) }] };
     },
@@ -231,25 +385,81 @@ export function buildServer(
     },
   );
 
-
   server.tool(
-    'heartbeat',
-    'Mark this agent as alive in the coordinator.',
-    {},
-    async () => {
-      const agent_id = envAgentId();
+    'ask',
+    'Turn a plain-language project request into a coordination task. Exclusive write tasks are claimed for the current agent.',
+    {
+      request: z.string().trim().min(1),
+    },
+    async ({ request }) => {
       const project_id = envProjectId();
+      const agent_id = process.env.CAVEMEM_AGENT_ID?.trim() || null;
+      const plan = inferTaskPlan(request);
+      const body = {
+        project_id,
+        ...plan,
+        created_by_agent_id: agent_id,
+      };
 
-      const result = client
-        ? await requestJson<unknown>(client, 'POST', '/api/agents/heartbeat', {
-            agent_id,
-            project_id,
-          })
-        : requireStore(store).storage.heartbeatAgent({ id: agent_id, project_id });
+      const task = client
+        ? await requestJson<unknown>(client, 'POST', '/api/tasks', body)
+        : requireStore(store).storage.createTask(body);
 
-      return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+      let claim: unknown = null;
+      const taskId =
+        typeof task === 'object' && task !== null && 'id' in task && typeof task.id === 'string'
+          ? task.id
+          : null;
+      const shouldClaim =
+        (plan.mode === 'exclusive' && plan.access === 'write') ||
+        (plan.kind === 'review' && shouldPerformReviewNow(request));
+
+      if (shouldClaim) {
+        const requiredAgentId = envAgentId();
+        if (!taskId) throw new Error('coordinator created a task without an id');
+        claim = client
+          ? await requestJson<unknown>(
+              client,
+              'POST',
+              `/api/tasks/${encodeURIComponent(taskId)}/claim`,
+              {},
+            )
+          : {
+              task: requireStore(store).storage.claimTaskById({
+                task_id: taskId,
+                agent_id: requiredAgentId,
+                project_id,
+              }),
+            };
+        if (
+          typeof claim !== 'object' ||
+          claim === null ||
+          !('task' in claim) ||
+          claim.task === null
+        ) {
+          throw new Error(`created task ${taskId} could not be claimed`);
+        }
+      }
+
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ plan, task, claim }) }],
+      };
     },
   );
+
+  server.tool('heartbeat', 'Mark this agent as alive in the coordinator.', {}, async () => {
+    const agent_id = envAgentId();
+    const project_id = envProjectId();
+
+    const result = client
+      ? await requestJson<unknown>(client, 'POST', '/api/agents/heartbeat', {
+          agent_id,
+          project_id,
+        })
+      : requireStore(store).storage.heartbeatAgent({ id: agent_id, project_id });
+
+    return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+  });
 
   server.tool(
     'create_task',
@@ -266,7 +476,18 @@ export function buildServer(
       priority: z.number().int().optional(),
       scope: z.array(z.string()).optional(),
     },
-    async ({ id, title, description, kind, access, mode, max_claims, required_results, priority, scope }) => {
+    async ({
+      id,
+      title,
+      description,
+      kind,
+      access,
+      mode,
+      max_claims,
+      required_results,
+      priority,
+      scope,
+    }) => {
       const project_id = envProjectId();
       const agent_id = process.env.CAVEMEM_AGENT_ID?.trim() || null;
 
@@ -338,24 +559,46 @@ export function buildServer(
     'claim_task',
     'Claim the next available task for this agent. Use before doing project work. Respect task kind/mode/access.',
     {
+      id: z.string().min(1).optional(),
       lease_ms: z.number().int().positive().optional(),
     },
-    async ({ lease_ms }) => {
+    async ({ id, lease_ms }) => {
       const agent_id = envAgentId();
       const project_id = envProjectId();
 
       const result = client
-        ? await requestJson<unknown>(client, 'POST', '/api/tasks/claim-next', {
-            ...(lease_ms !== undefined ? { lease_ms } : {}),
-          })
-        : {
-            task: requireStore(store).storage.claimNextTask({
-              agent_id,
-              project_id,
+        ? await requestJson<unknown>(
+            client,
+            'POST',
+            id ? `/api/tasks/${encodeURIComponent(id)}/claim` : '/api/tasks/claim-next',
+            {
               ...(lease_ms !== undefined ? { lease_ms } : {}),
-            }),
+            },
+          )
+        : {
+            task: id
+              ? requireStore(store).storage.claimTaskById({
+                  task_id: id,
+                  agent_id,
+                  project_id,
+                  ...(lease_ms !== undefined ? { lease_ms } : {}),
+                })
+              : requireStore(store).storage.claimNextTask({
+                  agent_id,
+                  project_id,
+                  ...(lease_ms !== undefined ? { lease_ms } : {}),
+                }),
           };
 
+      if (
+        id &&
+        (typeof result !== 'object' ||
+          result === null ||
+          !('task' in result) ||
+          result.task === null)
+      ) {
+        throw new Error(`task ${id} is not available to this agent`);
+      }
       return { content: [{ type: 'text', text: JSON.stringify(result) }] };
     },
   );
@@ -397,6 +640,7 @@ export function buildServer(
             project_id,
           });
 
+      if (!updated) throw new Error(`task ${id} is not actively claimed by this agent`);
       return { content: [{ type: 'text', text: JSON.stringify(updated) }] };
     },
   );
@@ -426,10 +670,10 @@ export function buildServer(
             ...(result !== undefined ? { result } : {}),
           });
 
+      if (!completed) throw new Error(`task ${id} is not actively claimed by this agent`);
       return { content: [{ type: 'text', text: JSON.stringify(completed) }] };
     },
   );
-
 
   server.tool(
     'release_task',
@@ -456,6 +700,7 @@ export function buildServer(
             ...(reason !== undefined ? { reason } : {}),
           });
 
+      if (!released) throw new Error(`task ${id} is not actively claimed by this agent`);
       return { content: [{ type: 'text', text: JSON.stringify(released) }] };
     },
   );
@@ -495,7 +740,6 @@ export function buildServer(
       return { content: [{ type: 'text', text: JSON.stringify(events) }] };
     },
   );
-
 
   return server;
 }

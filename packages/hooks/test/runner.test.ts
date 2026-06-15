@@ -31,6 +31,21 @@ describe('runHook', () => {
     expect(typeof r.context).toBe('string');
   });
 
+  it('session-start directs natural-language project work through cavemem.ask', async () => {
+    const r = await runHook(
+      'session-start',
+      {
+        session_id: 'sess-coordination',
+        ide: 'claude-code',
+        metadata: { agent_id: 'agent-a', project_id: 'project-a' },
+      },
+      { store },
+    );
+
+    expect(r.context).toContain('call cavemem.ask with their plain-language request');
+    expect(r.context).toContain('Do not ask the user for YAML, JSON, or internal task fields');
+  });
+
   it('user-prompt-submit records a compressed observation', async () => {
     await runHook('session-start', { session_id: 'sess-b', ide: 'claude-code' }, { store });
     const r = await runHook(
