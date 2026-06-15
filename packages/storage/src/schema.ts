@@ -64,5 +64,64 @@ CREATE TABLE IF NOT EXISTS embeddings (
 );
 CREATE INDEX IF NOT EXISTS idx_embeddings_model ON embeddings(model, dim);
 
+
+CREATE TABLE IF NOT EXISTS agents (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('idle','busy','offline')),
+  last_seen INTEGER NOT NULL,
+  current_task_id TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_agents_project ON agents(project_id, last_seen);
+
+CREATE TABLE IF NOT EXISTS tasks (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL,
+  title TEXT NOT NULL,
+  description TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('todo','in_progress','blocked','done','cancelled')),
+  mode TEXT NOT NULL DEFAULT 'exclusive' CHECK(mode IN ('exclusive','parallel_review')),
+  max_claims INTEGER NOT NULL DEFAULT 1,
+  required_results INTEGER NOT NULL DEFAULT 1,
+  priority INTEGER NOT NULL DEFAULT 0,
+  owner_agent_id TEXT,
+  lease_until INTEGER,
+  scope TEXT,
+  result TEXT,
+  created_by_agent_id TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_tasks_project_status ON tasks(project_id, status, priority, created_at);
+CREATE INDEX IF NOT EXISTS idx_tasks_owner ON tasks(owner_agent_id, status);
+
+CREATE TABLE IF NOT EXISTS task_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  project_id TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  content TEXT,
+  ts INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_task_events_task ON task_events(task_id, ts);
+CREATE INDEX IF NOT EXISTS idx_task_events_project ON task_events(project_id, ts);
+
+CREATE TABLE IF NOT EXISTS task_claims (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  project_id TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('claimed','submitted','released','expired')),
+  lease_until INTEGER,
+  result TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  UNIQUE(task_id, agent_id)
+);
+CREATE INDEX IF NOT EXISTS idx_task_claims_task ON task_claims(task_id, status);
+CREATE INDEX IF NOT EXISTS idx_task_claims_agent ON task_claims(agent_id, status);
+CREATE INDEX IF NOT EXISTS idx_task_claims_project ON task_claims(project_id, status);
+
 INSERT OR IGNORE INTO schema_version(version) VALUES (2);
 `;

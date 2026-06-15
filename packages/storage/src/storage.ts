@@ -1,14 +1,24 @@
+import { randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import Database from 'better-sqlite3';
 import { SCHEMA_SQL } from './schema.js';
 import type {
+  AgentRow,
+  ClaimTaskInput,
+  CreateTaskInput,
   NewObservation,
   NewSummary,
   ObservationRow,
   SearchHit,
   SessionRow,
   SummaryRow,
+  TaskClaimRow,
+  TaskEventInput,
+  TaskEventRow,
+  TaskRow,
+  TaskStatus,
+  UpdateTaskInput,
 } from './types.js';
 
 export interface StorageOptions {
@@ -22,6 +32,39 @@ export class Storage {
     mkdirSync(dirname(dbPath), { recursive: true });
     this.db = new Database(dbPath, opts.readonly ? { readonly: true } : {});
     this.db.exec(SCHEMA_SQL);
+    this.migrateCoordinationSchema();
+  }
+
+
+  private migrateCoordinationSchema(): void {
+    const taskColumns = this.db.prepare('PRAGMA table_info(tasks)').all() as Array<{ name: string }>;
+    const names = new Set(taskColumns.map((c) => c.name));
+
+    const addColumn = (name: string, ddl: string) => {
+      if (!names.has(name)) this.db.exec(`ALTER TABLE tasks ADD COLUMN ${ddl}`);
+    };
+
+    addColumn('mode', "mode TEXT NOT NULL DEFAULT 'exclusive' CHECK(mode IN ('exclusive','parallel_review'))");
+    addColumn('max_claims', 'max_claims INTEGER NOT NULL DEFAULT 1');
+    addColumn('required_results', 'required_results INTEGER NOT NULL DEFAULT 1');
+
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS task_claims (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        project_id TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('claimed','submitted','released','expired')),
+        lease_until INTEGER,
+        result TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        UNIQUE(task_id, agent_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_task_claims_task ON task_claims(task_id, status);
+      CREATE INDEX IF NOT EXISTS idx_task_claims_agent ON task_claims(agent_id, status);
+      CREATE INDEX IF NOT EXISTS idx_task_claims_project ON task_claims(project_id, status);
+    `);
   }
 
   close(): void {
@@ -173,6 +216,461 @@ export class Storage {
       ts: r.ts,
     }));
   }
+
+
+  // --- coordination ---
+
+  upsertAgent(p: {
+    id: string;
+    project_id: string;
+    status?: 'idle' | 'busy' | 'offline';
+    current_task_id?: string | null;
+  }): AgentRow {
+    const now = Date.now();
+    const existing = this.db.prepare('SELECT * FROM agents WHERE id = ?').get(p.id) as
+      | AgentRow
+      | undefined;
+
+    const status = p.status ?? existing?.status ?? 'idle';
+    const currentTaskId =
+      p.current_task_id !== undefined ? p.current_task_id : existing?.current_task_id ?? null;
+
+    this.db
+      .prepare(
+        `INSERT INTO agents(id, project_id, status, last_seen, current_task_id)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           project_id = excluded.project_id,
+           status = excluded.status,
+           last_seen = excluded.last_seen,
+           current_task_id = excluded.current_task_id`,
+      )
+      .run(p.id, p.project_id, status, now, currentTaskId);
+
+    return this.db.prepare('SELECT * FROM agents WHERE id = ?').get(p.id) as AgentRow;
+  }
+
+  listAgents(projectId: string): AgentRow[] {
+    return this.db
+      .prepare('SELECT * FROM agents WHERE project_id = ? ORDER BY last_seen DESC')
+      .all(projectId) as AgentRow[];
+  }
+
+  createTask(p: CreateTaskInput): TaskRow {
+    const now = Date.now();
+    const id = p.id ?? randomUUID();
+    const mode = p.mode ?? 'exclusive';
+    const maxClaims = mode === 'exclusive' ? 1 : Math.max(1, p.max_claims ?? 3);
+    const requiredResults = mode === 'exclusive' ? 1 : Math.max(1, p.required_results ?? maxClaims);
+    const priority = p.priority ?? 0;
+    const scope = p.scope === undefined ? null : JSON.stringify(p.scope);
+
+    this.db
+      .prepare(
+        `INSERT INTO tasks(
+           id, project_id, title, description, status, mode, max_claims, required_results,
+           priority, owner_agent_id, lease_until, scope, result, created_by_agent_id,
+           created_at, updated_at
+         )
+         VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, NULL, NULL, ?, NULL, ?, ?, ?)`,
+      )
+      .run(
+        id,
+        p.project_id,
+        p.title,
+        p.description,
+        mode,
+        maxClaims,
+        requiredResults,
+        priority,
+        scope,
+        p.created_by_agent_id ?? null,
+        now,
+        now,
+      );
+
+    return this.getTask(id)!;
+  }
+
+  getTask(id: string): TaskRow | undefined {
+    return this.db.prepare('SELECT * FROM tasks WHERE id = ?').get(id) as TaskRow | undefined;
+  }
+
+  listTasks(projectId: string, opts: { status?: TaskStatus; limit?: number } = {}): TaskRow[] {
+    const limit = opts.limit ?? 100;
+    if (opts.status) {
+      return this.db
+        .prepare(
+          `SELECT * FROM tasks
+           WHERE project_id = ? AND status = ?
+           ORDER BY priority DESC, created_at ASC
+           LIMIT ?`,
+        )
+        .all(projectId, opts.status, limit) as TaskRow[];
+    }
+
+    return this.db
+      .prepare(
+        `SELECT * FROM tasks
+         WHERE project_id = ?
+         ORDER BY
+           CASE status
+             WHEN 'in_progress' THEN 0
+             WHEN 'blocked' THEN 1
+             WHEN 'todo' THEN 2
+             WHEN 'done' THEN 3
+             ELSE 4
+           END,
+           priority DESC,
+           created_at ASC
+         LIMIT ?`,
+      )
+      .all(projectId, limit) as TaskRow[];
+  }
+
+  claimNextTask(p: ClaimTaskInput): TaskRow | null {
+    const now = Date.now();
+    const leaseMs = p.lease_ms ?? 10 * 60 * 1000;
+    const leaseUntil = now + leaseMs;
+
+    const tx = this.db.transaction(() => {
+      this.db
+        .prepare(
+          `UPDATE task_claims
+           SET status = 'expired', lease_until = NULL, updated_at = ?
+           WHERE status = 'claimed'
+             AND lease_until IS NOT NULL
+             AND lease_until < ?`,
+        )
+        .run(now, now);
+
+      this.db
+        .prepare(
+          `UPDATE tasks
+           SET status = 'todo', owner_agent_id = NULL, lease_until = NULL, updated_at = ?
+           WHERE project_id = ?
+             AND status = 'in_progress'
+             AND NOT EXISTS (
+               SELECT 1 FROM task_claims c
+               WHERE c.task_id = tasks.id
+                 AND c.status IN ('claimed','submitted')
+             )`,
+        )
+        .run(now, p.project_id);
+
+      const candidate = this.db
+        .prepare(
+          `SELECT t.*
+           FROM tasks t
+           WHERE t.project_id = ?
+             AND t.status IN ('todo','in_progress')
+             AND NOT EXISTS (
+               SELECT 1 FROM task_claims mine
+               WHERE mine.task_id = t.id
+                 AND mine.agent_id = ?
+                 AND mine.status IN ('claimed','submitted')
+             )
+             AND (
+               (
+                 t.mode = 'exclusive'
+                 AND t.status = 'todo'
+                 AND NOT EXISTS (
+                   SELECT 1 FROM task_claims c
+                   WHERE c.task_id = t.id
+                     AND c.status = 'claimed'
+                 )
+               )
+               OR
+               (
+                 t.mode = 'parallel_review'
+                 AND (
+                   SELECT COUNT(*) FROM task_claims c
+                   WHERE c.task_id = t.id
+                     AND c.status IN ('claimed','submitted')
+                 ) < t.max_claims
+               )
+             )
+           ORDER BY t.priority DESC, t.created_at ASC
+           LIMIT 1`,
+        )
+        .get(p.project_id, p.agent_id) as TaskRow | undefined;
+
+      if (!candidate) {
+        this.upsertAgent({
+          id: p.agent_id,
+          project_id: p.project_id,
+          status: 'idle',
+          current_task_id: null,
+        });
+        return null;
+      }
+
+      const claimId = randomUUID();
+
+      this.db
+        .prepare(
+          `INSERT INTO task_claims(
+             id, task_id, project_id, agent_id, status, lease_until, result, created_at, updated_at
+           )
+           VALUES (?, ?, ?, ?, 'claimed', ?, NULL, ?, ?)`,
+        )
+        .run(claimId, candidate.id, p.project_id, p.agent_id, leaseUntil, now, now);
+
+      if (candidate.mode === 'exclusive') {
+        this.db
+          .prepare(
+            `UPDATE tasks
+             SET status = 'in_progress',
+                 owner_agent_id = ?,
+                 lease_until = ?,
+                 updated_at = ?
+             WHERE id = ?`,
+          )
+          .run(p.agent_id, leaseUntil, now, candidate.id);
+      } else {
+        this.db
+          .prepare(
+            `UPDATE tasks
+             SET status = 'in_progress',
+                 owner_agent_id = NULL,
+                 lease_until = NULL,
+                 updated_at = ?
+             WHERE id = ?`,
+          )
+          .run(now, candidate.id);
+      }
+
+      this.upsertAgent({
+        id: p.agent_id,
+        project_id: p.project_id,
+        status: 'busy',
+        current_task_id: candidate.id,
+      });
+
+      this.insertTaskEvent({
+        task_id: candidate.id,
+        project_id: p.project_id,
+        agent_id: p.agent_id,
+        kind: 'claimed',
+        content: `claim_id=${claimId} lease_until=${leaseUntil}`,
+      });
+
+      return this.getTask(candidate.id) ?? null;
+    });
+
+    return tx();
+  }
+
+  updateTask(id: string, p: UpdateTaskInput & { agent_id?: string; project_id?: string }): TaskRow | null {
+    const existing = this.getTask(id);
+    if (!existing) return null;
+
+    const now = Date.now();
+    const status = p.status ?? existing.status;
+    const result = p.result !== undefined ? p.result : existing.result;
+    const leaseUntil = p.lease_ms !== undefined ? now + p.lease_ms : existing.lease_until;
+
+    this.db
+      .prepare(
+        `UPDATE tasks
+         SET status = ?, result = ?, lease_until = ?, updated_at = ?
+         WHERE id = ?`,
+      )
+      .run(status, result, leaseUntil, now, id);
+
+    if (p.agent_id && p.project_id && p.content) {
+      this.insertTaskEvent({
+        task_id: id,
+        project_id: p.project_id,
+        agent_id: p.agent_id,
+        kind: status === 'blocked' ? 'blocked' : 'progress',
+        content: p.content,
+      });
+    }
+
+    return this.getTask(id) ?? null;
+  }
+
+  completeTask(p: { id: string; project_id: string; agent_id: string; result?: string | null }): TaskRow | null {
+    const now = Date.now();
+
+    const tx = this.db.transaction(() => {
+      const task = this.getTask(p.id);
+      if (!task) return null;
+
+      this.db
+        .prepare(
+          `UPDATE task_claims
+           SET status = 'submitted',
+               result = ?,
+               lease_until = NULL,
+               updated_at = ?
+           WHERE task_id = ?
+             AND agent_id = ?
+             AND status = 'claimed'`,
+        )
+        .run(p.result ?? null, now, p.id, p.agent_id);
+
+      const submitted = this.db
+        .prepare(
+          `SELECT COUNT(*) AS n FROM task_claims
+           WHERE task_id = ?
+             AND status = 'submitted'`,
+        )
+        .get(p.id) as { n: number };
+
+      const shouldFinish =
+        task.mode === 'exclusive' || submitted.n >= Math.min(task.required_results, task.max_claims);
+
+      if (shouldFinish) {
+        this.db
+          .prepare(
+            `UPDATE tasks
+             SET status = 'done',
+                 result = ?,
+                 owner_agent_id = NULL,
+                 lease_until = NULL,
+                 updated_at = ?
+             WHERE id = ?`,
+          )
+          .run(task.mode === 'exclusive' ? p.result ?? task.result : task.result, now, p.id);
+      } else {
+        this.db
+          .prepare(
+            `UPDATE tasks
+             SET status = 'in_progress',
+                 updated_at = ?
+             WHERE id = ?`,
+          )
+          .run(now, p.id);
+      }
+
+      this.upsertAgent({
+        id: p.agent_id,
+        project_id: p.project_id,
+        status: 'idle',
+        current_task_id: null,
+      });
+
+      this.insertTaskEvent({
+        task_id: p.id,
+        project_id: p.project_id,
+        agent_id: p.agent_id,
+        kind: 'submitted',
+        content: p.result ?? null,
+      });
+
+      if (shouldFinish) {
+        this.insertTaskEvent({
+          task_id: p.id,
+          project_id: p.project_id,
+          agent_id: p.agent_id,
+          kind: 'done',
+          content: task.mode === 'parallel_review' ? `submitted=${submitted.n}` : p.result ?? null,
+        });
+      }
+
+      return this.getTask(p.id) ?? null;
+    });
+
+    return tx();
+  }
+
+  releaseTask(p: { id: string; project_id: string; agent_id: string; reason?: string | null }): TaskRow | null {
+    const now = Date.now();
+
+    const tx = this.db.transaction(() => {
+      const task = this.getTask(p.id);
+      if (!task) return null;
+
+      this.db
+        .prepare(
+          `UPDATE task_claims
+           SET status = 'released',
+               lease_until = NULL,
+               updated_at = ?
+           WHERE task_id = ?
+             AND agent_id = ?
+             AND status = 'claimed'`,
+        )
+        .run(now, p.id, p.agent_id);
+
+      const active = this.db
+        .prepare(
+          `SELECT COUNT(*) AS n FROM task_claims
+           WHERE task_id = ?
+             AND status IN ('claimed','submitted')`,
+        )
+        .get(p.id) as { n: number };
+
+      this.db
+        .prepare(
+          `UPDATE tasks
+           SET status = ?,
+               owner_agent_id = NULL,
+               lease_until = NULL,
+               updated_at = ?
+           WHERE id = ?`,
+        )
+        .run(active.n > 0 ? 'in_progress' : 'todo', now, p.id);
+
+      this.upsertAgent({
+        id: p.agent_id,
+        project_id: p.project_id,
+        status: 'idle',
+        current_task_id: null,
+      });
+
+      this.insertTaskEvent({
+        task_id: p.id,
+        project_id: p.project_id,
+        agent_id: p.agent_id,
+        kind: 'released',
+        content: p.reason ?? null,
+      });
+
+      return this.getTask(p.id) ?? null;
+    });
+
+    return tx();
+  }
+
+  heartbeatAgent(p: { id: string; project_id: string }): AgentRow {
+    const current = this.db.prepare('SELECT * FROM agents WHERE id = ?').get(p.id) as
+      | AgentRow
+      | undefined;
+
+    return this.upsertAgent({
+      id: p.id,
+      project_id: p.project_id,
+      status: current?.status ?? 'idle',
+      current_task_id: current?.current_task_id ?? null,
+    });
+  }
+
+  insertTaskEvent(p: TaskEventInput): number {
+    const info = this.db
+      .prepare(
+        `INSERT INTO task_events(task_id, project_id, agent_id, kind, content, ts)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(p.task_id, p.project_id, p.agent_id, p.kind, p.content ?? null, Date.now());
+
+    return Number(info.lastInsertRowid);
+  }
+
+  listTaskEvents(taskId: string, limit = 100): TaskEventRow[] {
+    return this.db
+      .prepare('SELECT * FROM task_events WHERE task_id = ? ORDER BY ts ASC LIMIT ?')
+      .all(taskId, limit) as TaskEventRow[];
+  }
+
+  listTaskClaims(taskId: string): TaskClaimRow[] {
+    return this.db
+      .prepare('SELECT * FROM task_claims WHERE task_id = ? ORDER BY created_at ASC')
+      .all(taskId) as TaskClaimRow[];
+  }
+
 
   // --- embeddings ---
 

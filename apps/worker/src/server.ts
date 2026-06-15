@@ -20,6 +20,19 @@ const HOOK_NAMES = new Set<HookName>([
   'session-end',
 ]);
 
+
+function jsonString(value: unknown): string | null {
+  if (typeof value === 'string') return value;
+  if (value == null) return null;
+  return JSON.stringify(value);
+}
+
+function requireHeader(c: { req: { header(name: string): string | undefined } }, name: string): string {
+  const value = c.req.header(name);
+  if (!value) throw new Error(`missing ${name}`);
+  return value;
+}
+
 export function buildApp(store: MemoryStore, loop?: EmbedLoopHandle): Hono {
   const app = new Hono();
 
@@ -64,6 +77,232 @@ export function buildApp(store: MemoryStore, loop?: EmbedLoopHandle): Hono {
     if (!result.ok) return c.json(result, 500);
     return c.json(result);
   });
+
+  app.post('/api/agents/heartbeat', async (c) => {
+    let body: Record<string, unknown> = {};
+    try {
+      body = await c.req.json();
+    } catch {
+      body = {};
+    }
+
+    const agentId = String(body.agent_id ?? c.req.header('x-cavemem-agent-id') ?? '');
+    const projectId = String(body.project_id ?? c.req.header('x-cavemem-project-id') ?? '');
+
+    if (!agentId) return c.json({ error: 'missing agent_id' }, 400);
+    if (!projectId) return c.json({ error: 'missing project_id' }, 400);
+
+    return c.json(store.storage.heartbeatAgent({ id: agentId, project_id: projectId }));
+  });
+
+  app.get('/api/agents', (c) => {
+    const projectId = c.req.query('project_id') ?? c.req.header('x-cavemem-project-id');
+    if (!projectId) return c.json({ error: 'missing project_id' }, 400);
+    return c.json(store.storage.listAgents(projectId));
+  });
+
+  app.post('/api/tasks', async (c) => {
+    let body: Record<string, unknown>;
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ error: 'invalid json body' }, 400);
+    }
+
+    const projectId = String(body.project_id ?? c.req.header('x-cavemem-project-id') ?? '');
+    const title = String(body.title ?? '');
+    const description = String(body.description ?? '');
+
+    if (!projectId) return c.json({ error: 'missing project_id' }, 400);
+    if (!title) return c.json({ error: 'missing title' }, 400);
+    if (!description) return c.json({ error: 'missing description' }, 400);
+
+    const mode =
+      body.mode === 'parallel_review' || body.mode === 'exclusive' ? body.mode : undefined;
+
+    const createTaskInput: Parameters<typeof store.storage.createTask>[0] = {
+      project_id: projectId,
+      title,
+      description,
+      priority: Number(body.priority ?? 0),
+      created_by_agent_id:
+        typeof body.created_by_agent_id === 'string'
+          ? body.created_by_agent_id
+          : c.req.header('x-cavemem-agent-id') ?? null,
+    };
+
+    if (typeof body.id === 'string') createTaskInput.id = body.id;
+    if (mode !== undefined) createTaskInput.mode = mode;
+    if (body.max_claims !== undefined) createTaskInput.max_claims = Number(body.max_claims);
+    if (body.required_results !== undefined) {
+      createTaskInput.required_results = Number(body.required_results);
+    }
+    if (body.scope !== undefined) createTaskInput.scope = body.scope;
+
+    const task = store.storage.createTask(createTaskInput);
+
+    return c.json(task, 201);
+  });
+
+  app.get('/api/tasks', (c) => {
+    const projectId = c.req.query('project_id') ?? c.req.header('x-cavemem-project-id');
+    if (!projectId) return c.json({ error: 'missing project_id' }, 400);
+
+    const status = c.req.query('status');
+    const limit = Number(c.req.query('limit') ?? 100);
+
+    const listOpts: {
+      status?: 'todo' | 'in_progress' | 'blocked' | 'done' | 'cancelled';
+      limit: number;
+    } = { limit };
+
+    if (
+      status === 'todo' ||
+      status === 'in_progress' ||
+      status === 'blocked' ||
+      status === 'done' ||
+      status === 'cancelled'
+    ) {
+      listOpts.status = status;
+    }
+
+    return c.json(store.storage.listTasks(projectId, listOpts));
+  });
+
+  app.post('/api/tasks/claim-next', async (c) => {
+    let body: Record<string, unknown> = {};
+    try {
+      body = await c.req.json();
+    } catch {
+      body = {};
+    }
+
+    const agentId = String(body.agent_id ?? c.req.header('x-cavemem-agent-id') ?? '');
+    const projectId = String(body.project_id ?? c.req.header('x-cavemem-project-id') ?? '');
+
+    if (!agentId) return c.json({ error: 'missing agent_id' }, 400);
+    if (!projectId) return c.json({ error: 'missing project_id' }, 400);
+
+    const task = store.storage.claimNextTask({
+      agent_id: agentId,
+      project_id: projectId,
+      lease_ms: Number(body.lease_ms ?? 10 * 60 * 1000),
+    });
+
+    if (!task) return c.json({ task: null });
+    return c.json({ task });
+  });
+
+  app.patch('/api/tasks/:id', async (c) => {
+    const id = c.req.param('id');
+
+    let body: Record<string, unknown>;
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ error: 'invalid json body' }, 400);
+    }
+
+    const agentId = c.req.header('x-cavemem-agent-id');
+    const projectId = c.req.header('x-cavemem-project-id') ?? String(body.project_id ?? '');
+
+    const rawStatus = body.status;
+    const status =
+      rawStatus === 'todo' ||
+      rawStatus === 'in_progress' ||
+      rawStatus === 'blocked' ||
+      rawStatus === 'done' ||
+      rawStatus === 'cancelled'
+        ? rawStatus
+        : undefined;
+
+    const updateTaskInput: {
+      status?: 'todo' | 'in_progress' | 'blocked' | 'done' | 'cancelled';
+      content?: string | null;
+      result?: string | null;
+      lease_ms?: number;
+      agent_id?: string;
+      project_id?: string;
+    } = {};
+
+    if (status !== undefined) updateTaskInput.status = status;
+    updateTaskInput.content = jsonString(body.content ?? body.progress);
+    if (body.result !== undefined) updateTaskInput.result = jsonString(body.result);
+    if (body.lease_ms !== undefined) updateTaskInput.lease_ms = Number(body.lease_ms);
+    if (agentId !== undefined) updateTaskInput.agent_id = agentId;
+    if (projectId) updateTaskInput.project_id = projectId;
+
+    const task = store.storage.updateTask(id, updateTaskInput);
+
+    if (!task) return c.json({ error: 'task not found' }, 404);
+    return c.json(task);
+  });
+
+  app.post('/api/tasks/:id/complete', async (c) => {
+    const id = c.req.param('id');
+
+    let body: Record<string, unknown> = {};
+    try {
+      body = await c.req.json();
+    } catch {
+      body = {};
+    }
+
+    const agentId = String(body.agent_id ?? c.req.header('x-cavemem-agent-id') ?? '');
+    const projectId = String(body.project_id ?? c.req.header('x-cavemem-project-id') ?? '');
+
+    if (!agentId) return c.json({ error: 'missing agent_id' }, 400);
+    if (!projectId) return c.json({ error: 'missing project_id' }, 400);
+
+    const task = store.storage.completeTask({
+      id,
+      agent_id: agentId,
+      project_id: projectId,
+      result: jsonString(body.result),
+    });
+
+    if (!task) return c.json({ error: 'task not found' }, 404);
+    return c.json(task);
+  });
+
+  app.post('/api/tasks/:id/release', async (c) => {
+    const id = c.req.param('id');
+
+    let body: Record<string, unknown> = {};
+    try {
+      body = await c.req.json();
+    } catch {
+      body = {};
+    }
+
+    const agentId = String(body.agent_id ?? c.req.header('x-cavemem-agent-id') ?? '');
+    const projectId = String(body.project_id ?? c.req.header('x-cavemem-project-id') ?? '');
+
+    if (!agentId) return c.json({ error: 'missing agent_id' }, 400);
+    if (!projectId) return c.json({ error: 'missing project_id' }, 400);
+
+    const task = store.storage.releaseTask({
+      id,
+      agent_id: agentId,
+      project_id: projectId,
+      reason: jsonString(body.reason),
+    });
+
+    if (!task) return c.json({ error: 'task not found' }, 404);
+    return c.json(task);
+  });
+
+  app.get('/api/tasks/:id/claims', (c) => {
+    const id = c.req.param('id');
+    return c.json(store.storage.listTaskClaims(id));
+  });
+
+  app.get('/api/tasks/:id/events', (c) => {
+    const id = c.req.param('id');
+    const limit = Number(c.req.query('limit') ?? 100);
+    return c.json(store.storage.listTaskEvents(id, limit));
+  });
+
 
   app.get('/api/state', (c) => {
     if (!loop) return c.json({ running: false });
