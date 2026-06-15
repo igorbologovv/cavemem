@@ -3,6 +3,11 @@ import type { HookInput } from '../types.js';
 
 export async function postToolUse(store: MemoryStore, input: HookInput): Promise<void> {
   const tool = input.tool_name ?? input.tool ?? 'unknown';
+
+  if (tool.startsWith('mcp__cavemem__')) {
+    return;
+  }
+
   const toolInput = input.tool_input;
   const toolOutput = input.tool_response ?? input.tool_output;
   const body =
@@ -15,7 +20,7 @@ export async function postToolUse(store: MemoryStore, input: HookInput): Promise
     session_id: input.session_id,
     kind: 'tool_use',
     content: body,
-    metadata: { tool },
+    metadata: { ...(input.metadata ?? {}), tool },
   });
 }
 

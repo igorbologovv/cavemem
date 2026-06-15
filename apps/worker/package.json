@@ -21,7 +21,8 @@
     "@cavemem/embedding": "workspace:*",
     "@cavemem/storage": "workspace:*",
     "hono": "^4.6.10",
-    "@hono/node-server": "^1.13.7"
+    "@hono/node-server": "^1.13.7",
+    "@cavemem/hooks": "workspace:*"
   },
   "devDependencies": {
     "tsup": "^8.3.5",

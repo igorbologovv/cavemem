@@ -5,11 +5,20 @@ import { pathToFileURL } from 'node:url';
 import { expand } from '@cavemem/compress';
 import { type Settings, loadSettings, resolveDataDir } from '@cavemem/config';
 import { MemoryStore } from '@cavemem/core';
+import { type HookName, runHook } from '@cavemem/hooks';
 import { createEmbedder } from '@cavemem/embedding';
 import { serve } from '@hono/node-server';
 import { Hono } from 'hono';
 import { type EmbedLoopHandle, startEmbedLoop, stateFilePath } from './embed-loop.js';
 import { renderIndex, renderSession } from './viewer.js';
+
+const HOOK_NAMES = new Set<HookName>([
+  'session-start',
+  'user-prompt-submit',
+  'post-tool-use',
+  'stop',
+  'session-end',
+]);
 
 export function buildApp(store: MemoryStore, loop?: EmbedLoopHandle): Hono {
   const app = new Hono();
@@ -20,6 +29,41 @@ export function buildApp(store: MemoryStore, loop?: EmbedLoopHandle): Hono {
   });
 
   app.get('/healthz', (c) => c.json({ ok: true }));
+
+  app.post('/api/hooks/:name', async (c) => {
+    const name = c.req.param('name') as HookName;
+    if (!HOOK_NAMES.has(name)) {
+      return c.json({ ok: false, ms: 0, error: `unsupported hook: ${name}` }, 400);
+    }
+
+    let input: Record<string, unknown>;
+    try {
+      input = await c.req.json();
+    } catch {
+      return c.json({ ok: false, ms: 0, error: 'invalid json body' }, 400);
+    }
+
+    const existingMetadata =
+      typeof input.metadata === 'object' && input.metadata !== null && !Array.isArray(input.metadata)
+        ? (input.metadata as Record<string, unknown>)
+        : {};
+
+    const metadata: Record<string, unknown> = { ...existingMetadata };
+
+    const agentId = c.req.header('x-cavemem-agent-id');
+    const projectId = c.req.header('x-cavemem-project-id');
+
+    if (agentId) metadata.agent_id = agentId;
+    if (projectId) metadata.project_id = projectId;
+
+    if (Object.keys(metadata).length > 0) {
+      input.metadata = metadata;
+    }
+
+    const result = await runHook(name, input as never, { store });
+    if (!result.ok) return c.json(result, 500);
+    return c.json(result);
+  });
 
   app.get('/api/state', (c) => {
     if (!loop) return c.json({ running: false });
@@ -42,6 +86,45 @@ export function buildApp(store: MemoryStore, loop?: EmbedLoopHandle): Hono {
     const q = c.req.query('q') ?? '';
     const limit = Number(c.req.query('limit') ?? 10);
     return c.json(await store.search(q, limit));
+  });
+
+  app.get('/api/timeline', (c) => {
+    const sessionId = c.req.query('session_id');
+    if (!sessionId) return c.json({ error: 'missing session_id' }, 400);
+
+    const aroundRaw = c.req.query('around_id');
+    const aroundId = aroundRaw ? Number(aroundRaw) : undefined;
+    const limit = Number(c.req.query('limit') ?? 200);
+
+    const rows = store.timeline(sessionId, aroundId, limit);
+    const compact = rows.map((r) => ({ id: r.id, kind: r.kind, ts: r.ts }));
+    return c.json(compact);
+  });
+
+  app.get('/api/observations', (c) => {
+    const raw = c.req.query('ids') ?? '';
+    const ids = raw
+      .split(',')
+      .map((x) => Number(x.trim()))
+      .filter((x) => Number.isInteger(x) && x > 0);
+
+    if (ids.length === 0) return c.json({ error: 'missing ids' }, 400);
+    if (ids.length > 50) return c.json({ error: 'too many ids' }, 400);
+
+    const expandRaw = c.req.query('expand');
+    const expand = expandRaw === undefined ? true : expandRaw !== 'false';
+
+    const rows = store.getObservations(ids, { expand });
+    return c.json(
+      rows.map((r) => ({
+        id: r.id,
+        session_id: r.session_id,
+        kind: r.kind,
+        ts: r.ts,
+        content: r.content,
+        metadata: r.metadata,
+      })),
+    );
   });
 
   app.get('/', (c) => c.html(renderIndex(store.storage.listSessions(50))));

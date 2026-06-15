@@ -9,6 +9,34 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 
+type HttpClient = {
+  endpoint: string;
+};
+
+function endpointFromEnv(): string | undefined {
+  const raw = process.env.CAVEMEM_ENDPOINT?.trim();
+  if (!raw) return undefined;
+  return raw.replace(/\/+$/, '');
+}
+
+async function getJson<T>(client: HttpClient, path: string): Promise<T> {
+  const response = await fetch(`${client.endpoint}${path}`);
+  const text = await response.text();
+
+  if (!response.ok) {
+    throw new Error(`endpoint ${path} failed (${response.status}): ${text.slice(0, 300)}`);
+  }
+
+  return JSON.parse(text) as T;
+}
+
+function requireStore(store: MemoryStore | null): MemoryStore {
+  if (!store) {
+    throw new Error('MemoryStore is unavailable because CAVEMEM_ENDPOINT mode is active');
+  }
+  return store;
+}
+
 /**
  * MCP stdio server exposing progressive-disclosure tools:
  * - search: compact hits with BM25 + optional semantic re-rank
@@ -16,17 +44,22 @@ import { z } from 'zod';
  * - get_observations: full bodies by ID
  * - list_sessions: recent sessions for navigation
  *
- * Embedder is loaded lazily on first search — keeps MCP handshake fast.
+ * When CAVEMEM_ENDPOINT is set, tools use the common coordinator API instead
+ * of opening SQLite directly. This is the multi-agent sandbox mode.
  */
-export function buildServer(store: MemoryStore, settings: Settings): McpServer {
+export function buildServer(
+  store: MemoryStore | null,
+  settings: Settings,
+  client?: HttpClient,
+): McpServer {
   const server = new McpServer({
     name: 'cavemem',
     version: '0.1.0',
   });
 
-  // tri-state: undefined = not yet attempted; null = unavailable (provider=none or load failed)
   let embedder: Embedder | null | undefined = undefined;
   const resolveEmbedder = async (): Promise<Embedder | null> => {
+    if (client) return null;
     if (embedder !== undefined) return embedder;
     try {
       embedder = await createEmbedder(settings, { log: () => {} });
@@ -44,8 +77,15 @@ export function buildServer(store: MemoryStore, settings: Settings): McpServer {
     'Search memory. Returns compact hits — fetch full bodies via get_observations.',
     { query: z.string().min(1), limit: z.number().int().positive().max(50).optional() },
     async ({ query, limit }) => {
-      const e = (await resolveEmbedder()) ?? undefined;
-      const hits = await store.search(query, limit, e);
+      const actualLimit = limit ?? 10;
+
+      const hits = client
+        ? await getJson<unknown[]>(
+            client,
+            `/api/search?q=${encodeURIComponent(query)}&limit=${actualLimit}`,
+          )
+        : await requireStore(store).search(query, actualLimit, (await resolveEmbedder()) ?? undefined);
+
       return {
         content: [{ type: 'text', text: JSON.stringify(hits) }],
       };
@@ -61,8 +101,19 @@ export function buildServer(store: MemoryStore, settings: Settings): McpServer {
       limit: z.number().int().positive().max(200).optional(),
     },
     async ({ session_id, around_id, limit }) => {
-      const rows = store.timeline(session_id, around_id, limit);
-      const compact = rows.map((r) => ({ id: r.id, kind: r.kind, ts: r.ts }));
+      const actualLimit = limit ?? 200;
+
+      const compact = client
+        ? await getJson<unknown[]>(
+            client,
+            `/api/timeline?session_id=${encodeURIComponent(session_id)}${
+              around_id ? `&around_id=${around_id}` : ''
+            }&limit=${actualLimit}`,
+          )
+        : requireStore(store)
+            .timeline(session_id, around_id, actualLimit)
+            .map((r) => ({ id: r.id, kind: r.kind, ts: r.ts }));
+
       return { content: [{ type: 'text', text: JSON.stringify(compact) }] };
     },
   );
@@ -75,15 +126,22 @@ export function buildServer(store: MemoryStore, settings: Settings): McpServer {
       expand: z.boolean().optional(),
     },
     async ({ ids, expand: expandOpt }) => {
-      const rows = store.getObservations(ids, { expand: expandOpt ?? true });
-      const payload = rows.map((r) => ({
-        id: r.id,
-        session_id: r.session_id,
-        kind: r.kind,
-        ts: r.ts,
-        content: r.content,
-        metadata: r.metadata,
-      }));
+      const expand = expandOpt ?? true;
+
+      const payload = client
+        ? await getJson<unknown[]>(
+            client,
+            `/api/observations?ids=${encodeURIComponent(ids.join(','))}&expand=${expand}`,
+          )
+        : requireStore(store).getObservations(ids, { expand }).map((r) => ({
+            id: r.id,
+            session_id: r.session_id,
+            kind: r.kind,
+            ts: r.ts,
+            content: r.content,
+            metadata: r.metadata,
+          }));
+
       return { content: [{ type: 'text', text: JSON.stringify(payload) }] };
     },
   );
@@ -93,20 +151,25 @@ export function buildServer(store: MemoryStore, settings: Settings): McpServer {
     'List recent sessions in reverse chronological order. Use to navigate before calling timeline.',
     { limit: z.number().int().positive().max(200).optional() },
     async ({ limit }) => {
-      const sessions = store.storage.listSessions(limit ?? 20);
+      const actualLimit = limit ?? 20;
+
+      const sessions = client
+        ? await getJson<unknown[]>(client, `/api/sessions?limit=${actualLimit}`)
+        : requireStore(store)
+            .storage.listSessions(actualLimit)
+            .map((s) => ({
+              id: s.id,
+              ide: s.ide,
+              cwd: s.cwd,
+              started_at: s.started_at,
+              ended_at: s.ended_at,
+            }));
+
       return {
         content: [
           {
             type: 'text',
-            text: JSON.stringify(
-              sessions.map((s) => ({
-                id: s.id,
-                ide: s.ide,
-                cwd: s.cwd,
-                started_at: s.started_at,
-                ended_at: s.ended_at,
-              })),
-            ),
+            text: JSON.stringify(sessions),
           },
         ],
       };
@@ -118,10 +181,16 @@ export function buildServer(store: MemoryStore, settings: Settings): McpServer {
 
 export async function main(): Promise<void> {
   const settings = loadSettings();
-  const dbPath = join(resolveDataDir(settings.dataDir), 'data.db');
-  const store = new MemoryStore({ dbPath, settings });
+  const endpoint = endpointFromEnv();
 
-  const server = buildServer(store, settings);
+  const store = endpoint
+    ? null
+    : new MemoryStore({
+        dbPath: join(resolveDataDir(settings.dataDir), 'data.db'),
+        settings,
+      });
+
+  const server = buildServer(store, settings, endpoint ? { endpoint } : undefined);
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }
