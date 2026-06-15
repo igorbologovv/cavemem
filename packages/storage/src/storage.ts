@@ -44,6 +44,8 @@ export class Storage {
       if (!names.has(name)) this.db.exec(`ALTER TABLE tasks ADD COLUMN ${ddl}`);
     };
 
+    addColumn('kind', "kind TEXT NOT NULL DEFAULT 'implementation' CHECK(kind IN ('review','implementation','investigation','test','docs'))");
+    addColumn('access', "access TEXT NOT NULL DEFAULT 'write' CHECK(access IN ('read_only','write'))");
     addColumn('mode', "mode TEXT NOT NULL DEFAULT 'exclusive' CHECK(mode IN ('exclusive','parallel_review'))");
     addColumn('max_claims', 'max_claims INTEGER NOT NULL DEFAULT 1');
     addColumn('required_results', 'required_results INTEGER NOT NULL DEFAULT 1');
@@ -250,6 +252,33 @@ export class Storage {
     return this.db.prepare('SELECT * FROM agents WHERE id = ?').get(p.id) as AgentRow;
   }
 
+
+  getActiveTaskForAgent(p: {
+    project_id: string;
+    agent_id: string;
+  }): (TaskRow & { claim_status: string; claim_lease_until: number | null }) | undefined {
+    const now = Date.now();
+
+    return this.db
+      .prepare(
+        `SELECT
+           t.*,
+           c.status AS claim_status,
+           c.lease_until AS claim_lease_until
+         FROM task_claims c
+         JOIN tasks t ON t.id = c.task_id
+         WHERE c.project_id = ?
+           AND c.agent_id = ?
+           AND c.status = 'claimed'
+           AND (c.lease_until IS NULL OR c.lease_until >= ?)
+         ORDER BY c.updated_at DESC
+         LIMIT 1`,
+      )
+      .get(p.project_id, p.agent_id, now) as
+      | (TaskRow & { claim_status: string; claim_lease_until: number | null })
+      | undefined;
+  }
+
   listAgents(projectId: string): AgentRow[] {
     return this.db
       .prepare('SELECT * FROM agents WHERE project_id = ? ORDER BY last_seen DESC')
@@ -260,6 +289,8 @@ export class Storage {
     const now = Date.now();
     const id = p.id ?? randomUUID();
     const mode = p.mode ?? 'exclusive';
+    const kind = p.kind ?? (mode === 'parallel_review' ? 'review' : 'implementation');
+    const access = p.access ?? (kind === 'review' || kind === 'investigation' ? 'read_only' : 'write');
     const maxClaims = mode === 'exclusive' ? 1 : Math.max(1, p.max_claims ?? 3);
     const requiredResults = mode === 'exclusive' ? 1 : Math.max(1, p.required_results ?? maxClaims);
     const priority = p.priority ?? 0;
@@ -268,17 +299,19 @@ export class Storage {
     this.db
       .prepare(
         `INSERT INTO tasks(
-           id, project_id, title, description, status, mode, max_claims, required_results,
+           id, project_id, title, description, kind, access, status, mode, max_claims, required_results,
            priority, owner_agent_id, lease_until, scope, result, created_by_agent_id,
            created_at, updated_at
          )
-         VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, NULL, NULL, ?, NULL, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, 'todo', ?, ?, ?, ?, NULL, NULL, ?, NULL, ?, ?, ?)`,
       )
       .run(
         id,
         p.project_id,
         p.title,
         p.description,
+        kind,
+        access,
         mode,
         maxClaims,
         requiredResults,
@@ -358,6 +391,29 @@ export class Storage {
         )
         .run(now, p.project_id);
 
+      const active = this.db
+        .prepare(
+          `SELECT t.*
+           FROM task_claims c
+           JOIN tasks t ON t.id = c.task_id
+           WHERE c.project_id = ?
+             AND c.agent_id = ?
+             AND c.status = 'claimed'
+           ORDER BY c.updated_at DESC
+           LIMIT 1`,
+        )
+        .get(p.project_id, p.agent_id) as TaskRow | undefined;
+
+      if (active) {
+        this.upsertAgent({
+          id: p.agent_id,
+          project_id: p.project_id,
+          status: 'busy',
+          current_task_id: active.id,
+        });
+        return active;
+      }
+
       const candidate = this.db
         .prepare(
           `SELECT t.*
@@ -405,16 +461,38 @@ export class Storage {
         return null;
       }
 
-      const claimId = randomUUID();
-
-      this.db
+      const existingClaim = this.db
         .prepare(
-          `INSERT INTO task_claims(
-             id, task_id, project_id, agent_id, status, lease_until, result, created_at, updated_at
-           )
-           VALUES (?, ?, ?, ?, 'claimed', ?, NULL, ?, ?)`,
+          `SELECT id FROM task_claims
+           WHERE task_id = ?
+             AND agent_id = ?
+           LIMIT 1`,
         )
-        .run(claimId, candidate.id, p.project_id, p.agent_id, leaseUntil, now, now);
+        .get(candidate.id, p.agent_id) as { id: string } | undefined;
+
+      const claimId = existingClaim?.id ?? randomUUID();
+
+      if (existingClaim) {
+        this.db
+          .prepare(
+            `UPDATE task_claims
+             SET status = 'claimed',
+                 lease_until = ?,
+                 result = NULL,
+                 updated_at = ?
+             WHERE id = ?`,
+          )
+          .run(leaseUntil, now, claimId);
+      } else {
+        this.db
+          .prepare(
+            `INSERT INTO task_claims(
+               id, task_id, project_id, agent_id, status, lease_until, result, created_at, updated_at
+             )
+             VALUES (?, ?, ?, ?, 'claimed', ?, NULL, ?, ?)`,
+          )
+          .run(claimId, candidate.id, p.project_id, p.agent_id, leaseUntil, now, now);
+      }
 
       if (candidate.mode === 'exclusive') {
         this.db

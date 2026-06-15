@@ -120,6 +120,18 @@ export function buildApp(store: MemoryStore, loop?: EmbedLoopHandle): Hono {
     const mode =
       body.mode === 'parallel_review' || body.mode === 'exclusive' ? body.mode : undefined;
 
+    const kind =
+      body.kind === 'review' ||
+      body.kind === 'implementation' ||
+      body.kind === 'investigation' ||
+      body.kind === 'test' ||
+      body.kind === 'docs'
+        ? body.kind
+        : undefined;
+
+    const access =
+      body.access === 'read_only' || body.access === 'write' ? body.access : undefined;
+
     const createTaskInput: Parameters<typeof store.storage.createTask>[0] = {
       project_id: projectId,
       title,
@@ -132,6 +144,8 @@ export function buildApp(store: MemoryStore, loop?: EmbedLoopHandle): Hono {
     };
 
     if (typeof body.id === 'string') createTaskInput.id = body.id;
+    if (kind !== undefined) createTaskInput.kind = kind;
+    if (access !== undefined) createTaskInput.access = access;
     if (mode !== undefined) createTaskInput.mode = mode;
     if (body.max_claims !== undefined) createTaskInput.max_claims = Number(body.max_claims);
     if (body.required_results !== undefined) {

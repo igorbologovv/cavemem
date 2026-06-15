@@ -134,6 +134,9 @@ importers:
       '@cavemem/embedding':
         specifier: workspace:*
         version: link:../../packages/embedding
+      '@cavemem/hooks':
+        specifier: workspace:*
+        version: link:../../packages/hooks
       '@cavemem/storage':
         specifier: workspace:*
         version: link:../../packages/storage

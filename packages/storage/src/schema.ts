@@ -79,6 +79,8 @@ CREATE TABLE IF NOT EXISTS tasks (
   project_id TEXT NOT NULL,
   title TEXT NOT NULL,
   description TEXT NOT NULL,
+  kind TEXT NOT NULL DEFAULT 'implementation' CHECK(kind IN ('review','implementation','investigation','test','docs')),
+  access TEXT NOT NULL DEFAULT 'write' CHECK(access IN ('read_only','write')),
   status TEXT NOT NULL CHECK(status IN ('todo','in_progress','blocked','done','cancelled')),
   mode TEXT NOT NULL DEFAULT 'exclusive' CHECK(mode IN ('exclusive','parallel_review')),
   max_claims INTEGER NOT NULL DEFAULT 1,

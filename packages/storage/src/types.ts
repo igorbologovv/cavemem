@@ -65,6 +65,10 @@ export interface AgentRow {
   current_task_id: string | null;
 }
 
+export type TaskKind = 'review' | 'implementation' | 'investigation' | 'test' | 'docs';
+
+export type TaskAccess = 'read_only' | 'write';
+
 export type TaskMode = 'exclusive' | 'parallel_review';
 
 export type TaskStatus = 'todo' | 'in_progress' | 'blocked' | 'done' | 'cancelled';
@@ -74,6 +78,8 @@ export interface TaskRow {
   project_id: string;
   title: string;
   description: string;
+  kind: TaskKind;
+  access: TaskAccess;
   status: TaskStatus;
   mode: TaskMode;
   max_claims: number;
@@ -117,6 +123,8 @@ export interface CreateTaskInput {
   project_id: string;
   title: string;
   description: string;
+  kind?: TaskKind;
+  access?: TaskAccess;
   mode?: TaskMode;
   max_claims?: number;
   required_results?: number;

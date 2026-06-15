@@ -8,6 +8,8 @@ export type {
   SearchHit,
   AgentStatus,
   AgentRow,
+  TaskKind,
+  TaskAccess,
   TaskMode,
   TaskStatus,
   TaskClaimStatus,
