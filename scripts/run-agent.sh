@@ -36,26 +36,36 @@ repo_basename() {
 
 project_id_for_workspace() {
   local workspace_path="$1"
+  local branch_name=""
+  local repo_name=""
   local project_id=""
   local origin_url=""
   local top_level=""
 
   if [[ -f "$workspace_path/.cavemem-project" ]]; then
     project_id="$(sed -n '1{s/^[[:space:]]*//; s/[[:space:]]*$//; p; q;}' "$workspace_path/.cavemem-project")"
-  elif [[ -d "$workspace_path/.git" || -f "$workspace_path/.git" ]]; then
+  else
+    top_level="$(git -C "$workspace_path" rev-parse --show-toplevel 2>/dev/null || true)"
+  fi
+
+  if [[ -z "$project_id" && -n "$top_level" ]]; then
     origin_url="$(git -C "$workspace_path" config --get remote.origin.url 2>/dev/null || true)"
     if [[ -n "$origin_url" ]]; then
-      project_id="$(repo_basename "$origin_url")"
+      repo_name="$(repo_basename "$origin_url")"
+    else
+      repo_name="$(basename "$top_level")"
     fi
+
+    branch_name="$(git -C "$workspace_path" branch --show-current 2>/dev/null || true)"
+    if [[ -z "$branch_name" ]]; then
+      branch_name="detached-$(git -C "$workspace_path" rev-parse --short HEAD 2>/dev/null || true)"
+    fi
+
+    project_id="${repo_name}__${branch_name}"
   fi
 
   if [[ -z "$project_id" ]]; then
-    top_level="$(git -C "$workspace_path" rev-parse --show-toplevel 2>/dev/null || true)"
-    if [[ -n "$top_level" ]]; then
-      project_id="$(basename "$top_level")"
-    else
-      project_id="$(basename "$workspace_path")"
-    fi
+    project_id="$(basename "$workspace_path")"
   fi
 
   project_id="$(normalize_project_id "$project_id")"
